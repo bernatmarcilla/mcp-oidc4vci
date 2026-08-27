@@ -48,7 +48,9 @@ Full details, component responsibilities, data flows, tool contracts, and securi
 
 ## Project status
 
-Early-stage. The architecture and MVP scope are drafted in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md). The project skeleton (uv project, FastMCP server instance, lint/type-check/test tooling) is in place; no MCP tools are implemented yet. See the roadmap's [Open Questions / Next Steps](docs/ROADMAP.md#open-questions--next-steps) for what needs to be nailed down before Phase 1 starts.
+Early-stage. The architecture and MVP scope are drafted in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+
+**Phase 1 (MCP Credential Offer Inspector) — in progress.** `inspect_credential_offer` is implemented: it resolves a Credential Offer by value or by reference (`credential_offer_uri`), validates it against OIDC4VCI 1.0, and returns the issuer, requested credential configuration IDs, and grants. See [src/mcp_oidc4vci/credential_offer.py](src/mcp_oidc4vci/credential_offer.py) and [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/).
 
 ---
 
