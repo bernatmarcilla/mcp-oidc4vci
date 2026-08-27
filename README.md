@@ -92,6 +92,16 @@ uv run mypy src
 uv run pytest
 ```
 
+### Testing the manual wallet-proof path without a real wallet
+
+[scripts/sign_proof.py](scripts/sign_proof.py) signs a spec-shaped proof JWT the same way `MockWalletAdapter` does, but as a separate process — useful for exercising `request_wallet_proof` / `submit_wallet_proof` (see [Architecture](docs/ARCHITECTURE.md#request_wallet_proof-and-submit_wallet_proof)) when there's no real wallet app on hand:
+
+```bash
+uv run scripts/sign_proof.py --audience https://issuer.example.com --nonce abc123
+```
+
+Pass its output straight to `submit_wallet_proof`'s `proof_jwt` argument.
+
 ---
 
 ## Documentation
