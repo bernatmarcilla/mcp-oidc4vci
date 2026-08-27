@@ -54,7 +54,9 @@ Early-stage. The architecture and MVP scope are drafted in [docs/ARCHITECTURE.md
 
 **Phase 2 (Metadata Discovery) — done.** `get_credential_issuer_metadata` fetches and validates a Credential Issuer's metadata from its well-known endpoint (correctly inserting the well-known path segment ahead of any path component in the issuer identifier, per spec), verifies the returned `credential_issuer` matches what was requested, and returns the credential endpoint, authorization servers, and supported credential configurations. See [src/mcp_oidc4vci/credential_issuer_metadata.py](src/mcp_oidc4vci/credential_issuer_metadata.py).
 
-Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage).
+**Phase 3 (Issuance Flow Engine) — done.** `describe_issuance_flow`, `initiate_issuance`, and `get_issuance_status` are implemented on top of an in-memory `IssuanceSessionStore`. For the pre-authorized code grant, `initiate_issuance` completes the real Token Request (OAuth Authorization Server discovery via RFC 8414, then the token exchange); for the authorization code grant it stops at `waiting_for_user_authorization`, since finishing that flow needs the wallet-driven redirect that Phase 4 will add. See [src/mcp_oidc4vci/issuance.py](src/mcp_oidc4vci/issuance.py), [src/mcp_oidc4vci/authorization_server_metadata.py](src/mcp_oidc4vci/authorization_server_metadata.py), and [src/mcp_oidc4vci/token_request.py](src/mcp_oidc4vci/token_request.py).
+
+Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 94 tests).
 
 ---
 

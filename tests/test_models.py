@@ -3,11 +3,15 @@ from pydantic import ValidationError
 
 from mcp_oidc4vci.models import (
     PRE_AUTHORIZED_CODE_GRANT_TYPE,
+    AuthorizationServerMetadata,
     CredentialConfiguration,
     CredentialIssuerMetadata,
     CredentialOffer,
     CredentialOfferGrants,
+    IssuanceFlowDescription,
     PreAuthorizedCodeGrant,
+    TokenErrorResponse,
+    TokenSuccessResponse,
 )
 
 
@@ -113,3 +117,31 @@ def test_credential_issuer_metadata_keys_configurations_by_id() -> None:
     assert metadata.credential_configurations_supported["UniversityDegreeCredential"].format == (
         "vc+sd-jwt"
     )
+
+
+def test_authorization_server_metadata_requires_issuer_and_token_endpoint() -> None:
+    with pytest.raises(ValidationError):
+        AuthorizationServerMetadata.model_validate({"issuer": "https://as.example.com"})
+
+
+def test_token_success_response_requires_access_token_and_token_type() -> None:
+    with pytest.raises(ValidationError):
+        TokenSuccessResponse.model_validate({"access_token": "abc"})
+
+
+def test_token_error_response_requires_error() -> None:
+    with pytest.raises(ValidationError):
+        TokenErrorResponse.model_validate({"error_description": "no code given"})
+
+
+def test_issuance_flow_description_dumps_its_ordered_steps() -> None:
+    description = IssuanceFlowDescription.model_validate(
+        {
+            "flow_type": "authorization_code",
+            "steps": [{"step": 1, "action": "user_authorization", "description": "..."}],
+        }
+    )
+
+    dumped = description.model_dump(mode="json")
+
+    assert dumped["steps"][0]["step"] == 1

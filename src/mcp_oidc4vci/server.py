@@ -10,8 +10,17 @@ from mcp_oidc4vci.credential_issuer_metadata import (
     get_credential_issuer_metadata as fetch_credential_issuer_metadata,
 )
 from mcp_oidc4vci.credential_offer import InvalidCredentialOfferError, resolve_credential_offer
+from mcp_oidc4vci.issuance import (
+    IssuanceSession,
+    IssuanceSessionNotFoundError,
+    IssuanceSessionStore,
+    UndeterminedIssuanceFlowError,
+)
+from mcp_oidc4vci.issuance import describe_issuance_flow as build_issuance_flow_description
+from mcp_oidc4vci.issuance import initiate_issuance as start_issuance
 
 mcp = FastMCP(name="oidc4vci")
+_sessions = IssuanceSessionStore()
 
 
 @mcp.tool
@@ -40,6 +49,53 @@ async def get_credential_issuer_metadata(credential_issuer: str) -> dict[str, An
     except InvalidCredentialIssuerMetadataError as exc:
         raise ToolError(str(exc)) from exc
     return metadata.model_dump(mode="json", exclude_none=True, by_alias=True)
+
+
+@mcp.tool
+async def describe_issuance_flow(credential_offer: str) -> dict[str, Any]:
+    """Describe the steps required to obtain the credential(s) offered by a Credential Offer.
+
+    Resolves the offer and returns which grant-based flow applies and its ordered steps.
+    """
+    try:
+        description = await build_issuance_flow_description(credential_offer)
+    except (InvalidCredentialOfferError, UndeterminedIssuanceFlowError) as exc:
+        raise ToolError(str(exc)) from exc
+    return description.model_dump(mode="json")
+
+
+@mcp.tool
+async def initiate_issuance(credential_offer: str, tx_code: str | None = None) -> dict[str, Any]:
+    """Start an issuance session for a Credential Offer.
+
+    For the pre-authorized code grant, completes the token exchange immediately and the
+    session ends `ready_for_credential_request` or `failed`. For the authorization code
+    grant, the session is left `waiting_for_user_authorization`, since completing it requires
+    a wallet-driven redirect not yet implemented. `tx_code` is the transaction code obtained
+    from the user out-of-band, if the offer requires one.
+    """
+    try:
+        session = await start_issuance(credential_offer, sessions=_sessions, tx_code=tx_code)
+    except (InvalidCredentialOfferError, UndeterminedIssuanceFlowError) as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
+@mcp.tool
+async def get_issuance_status(session_id: str) -> dict[str, Any]:
+    """Return the current state of a previously started issuance session."""
+    try:
+        session = await _sessions.get(session_id)
+    except IssuanceSessionNotFoundError as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
+def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
+    output: dict[str, Any] = {"session_id": session.session_id, "status": session.status}
+    if session.error is not None:
+        output["error"] = session.error
+    return output
 
 
 def main() -> None:

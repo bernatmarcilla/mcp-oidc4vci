@@ -88,3 +88,41 @@ class CredentialIssuerMetadata(BaseModel):
     credential_endpoint: str
     authorization_servers: list[str] | None = None
     credential_configurations_supported: dict[str, CredentialConfiguration]
+
+
+class AuthorizationServerMetadata(BaseModel):
+    """OAuth 2.0 Authorization Server Metadata (RFC 8414), fetched from its well-known
+    endpoint to discover the token endpoint used by the pre-authorized code grant."""
+
+    issuer: str
+    token_endpoint: str
+
+
+class TokenSuccessResponse(BaseModel):
+    """A successful Token Response (spec "Successful Token Response")."""
+
+    access_token: str
+    token_type: str
+    expires_in: int | None = None
+
+
+class TokenErrorResponse(BaseModel):
+    """A Token Error Response (spec "Token Error Response", RFC 6749 §5.2)."""
+
+    error: str
+    error_description: str | None = None
+
+
+class IssuanceFlowStep(BaseModel):
+    """A single step in a normalized issuance flow description."""
+
+    step: int
+    action: str
+    description: str
+
+
+class IssuanceFlowDescription(BaseModel):
+    """A normalized description of the steps required to obtain an offered credential."""
+
+    flow_type: str
+    steps: list[IssuanceFlowStep]
