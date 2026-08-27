@@ -3,6 +3,8 @@ from pydantic import ValidationError
 
 from mcp_oidc4vci.models import (
     PRE_AUTHORIZED_CODE_GRANT_TYPE,
+    CredentialConfiguration,
+    CredentialIssuerMetadata,
     CredentialOffer,
     CredentialOfferGrants,
     PreAuthorizedCodeGrant,
@@ -72,3 +74,42 @@ def test_credential_offer_dumps_the_pre_authorized_code_grant_under_its_urn_key(
 
     assert dumped["grants"][PRE_AUTHORIZED_CODE_GRANT_TYPE]["pre-authorized_code"] == "abc123"
     assert "authorization_code" not in dumped["grants"]
+
+
+def test_credential_configuration_requires_a_format() -> None:
+    with pytest.raises(ValidationError):
+        CredentialConfiguration.model_validate({})
+
+
+def test_credential_configuration_parses_its_nested_display_name() -> None:
+    config = CredentialConfiguration.model_validate(
+        {
+            "format": "vc+sd-jwt",
+            "credential_metadata": {"display": [{"name": "University Degree"}]},
+        }
+    )
+
+    assert config.credential_metadata is not None
+    assert config.credential_metadata.display is not None
+    assert config.credential_metadata.display[0].name == "University Degree"
+
+
+def test_credential_issuer_metadata_requires_credential_endpoint_and_configurations() -> None:
+    with pytest.raises(ValidationError):
+        CredentialIssuerMetadata.model_validate({"credential_issuer": "https://issuer.example.com"})
+
+
+def test_credential_issuer_metadata_keys_configurations_by_id() -> None:
+    metadata = CredentialIssuerMetadata.model_validate(
+        {
+            "credential_issuer": "https://issuer.example.com",
+            "credential_endpoint": "https://issuer.example.com/credential",
+            "credential_configurations_supported": {
+                "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+            },
+        }
+    )
+
+    assert metadata.credential_configurations_supported["UniversityDegreeCredential"].format == (
+        "vc+sd-jwt"
+    )

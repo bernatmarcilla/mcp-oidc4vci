@@ -3,6 +3,12 @@ from typing import Any
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from mcp_oidc4vci.credential_issuer_metadata import (
+    InvalidCredentialIssuerMetadataError,
+)
+from mcp_oidc4vci.credential_issuer_metadata import (
+    get_credential_issuer_metadata as fetch_credential_issuer_metadata,
+)
 from mcp_oidc4vci.credential_offer import InvalidCredentialOfferError, resolve_credential_offer
 
 mcp = FastMCP(name="oidc4vci")
@@ -20,6 +26,20 @@ async def inspect_credential_offer(credential_offer: str) -> dict[str, Any]:
     except InvalidCredentialOfferError as exc:
         raise ToolError(str(exc)) from exc
     return offer.model_dump(mode="json", exclude_none=True, by_alias=True)
+
+
+@mcp.tool
+async def get_credential_issuer_metadata(credential_issuer: str) -> dict[str, Any]:
+    """Fetch and validate a Credential Issuer's metadata from its well-known endpoint.
+
+    Returns the issuer's credential endpoint, authorization servers, and the credential
+    configurations it supports.
+    """
+    try:
+        metadata = await fetch_credential_issuer_metadata(credential_issuer)
+    except InvalidCredentialIssuerMetadataError as exc:
+        raise ToolError(str(exc)) from exc
+    return metadata.model_dump(mode="json", exclude_none=True, by_alias=True)
 
 
 def main() -> None:

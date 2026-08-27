@@ -1,4 +1,3 @@
-from collections.abc import Callable
 from urllib.parse import quote
 
 import httpx
@@ -6,6 +5,7 @@ import pytest
 
 from mcp_oidc4vci import credential_offer
 from mcp_oidc4vci.credential_offer import InvalidCredentialOfferError, resolve_credential_offer
+from support import mock_async_client
 
 BY_VALUE_OFFER_JSON = (
     '{"credential_issuer": "https://issuer.example.com", '
@@ -128,20 +128,6 @@ async def test_does_not_double_wrap_an_invalid_offer_error_raised_by_the_fetcher
     assert str(excinfo.value) == "the referenced offer has expired"
 
 
-def _mock_async_client(
-    handler: Callable[[httpx.Request], httpx.Response],
-) -> Callable[..., httpx.AsyncClient]:
-    """Patch target for `httpx.AsyncClient` that routes requests through a MockTransport."""
-    original_async_client = httpx.AsyncClient
-    transport = httpx.MockTransport(handler)
-
-    def factory(*args: object, **kwargs: object) -> httpx.AsyncClient:
-        kwargs["transport"] = transport
-        return original_async_client(*args, **kwargs)  # type: ignore[arg-type]
-
-    return factory
-
-
 async def test_default_fetcher_performs_an_https_get(monkeypatch: pytest.MonkeyPatch) -> None:
     requested_urls: list[str] = []
 
@@ -149,7 +135,7 @@ async def test_default_fetcher_performs_an_https_get(monkeypatch: pytest.MonkeyP
         requested_urls.append(str(request.url))
         return httpx.Response(200, text=BY_VALUE_OFFER_JSON)
 
-    monkeypatch.setattr(httpx, "AsyncClient", _mock_async_client(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
 
     body = await credential_offer._fetch_offer_uri("https://issuer.example.com/offers/1")
 
@@ -161,7 +147,7 @@ async def test_default_fetcher_raises_for_an_http_error_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        httpx, "AsyncClient", _mock_async_client(lambda request: httpx.Response(404))
+        httpx, "AsyncClient", mock_async_client(lambda request: httpx.Response(404))
     )
 
     with pytest.raises(httpx.HTTPStatusError):

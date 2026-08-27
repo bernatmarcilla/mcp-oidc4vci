@@ -55,3 +55,36 @@ class CredentialOffer(BaseModel):
     credential_issuer: str
     credential_configuration_ids: list[str] = Field(min_length=1)
     grants: CredentialOfferGrants | None = None
+
+
+class CredentialDisplay(BaseModel):
+    """A localized display entry from a credential configuration's `credential_metadata`."""
+
+    name: str
+    locale: str | None = None
+
+
+class CredentialMetadata(BaseModel):
+    """The `credential_metadata` object of a credential configuration entry."""
+
+    display: list[CredentialDisplay] | None = None
+
+
+class CredentialConfiguration(BaseModel):
+    """A single entry of `credential_configurations_supported`, describing one issuable
+    credential."""
+
+    format: str
+    scope: str | None = None
+    cryptographic_binding_methods_supported: list[str] | None = None
+    credential_signing_alg_values_supported: list[str] | None = None
+    credential_metadata: CredentialMetadata | None = None
+
+
+class CredentialIssuerMetadata(BaseModel):
+    """Credential Issuer Metadata, fetched from the issuer's well-known endpoint."""
+
+    credential_issuer: str
+    credential_endpoint: str
+    authorization_servers: list[str] | None = None
+    credential_configurations_supported: dict[str, CredentialConfiguration]
