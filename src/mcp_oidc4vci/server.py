@@ -10,6 +10,8 @@ from mcp_oidc4vci.credential_issuer_metadata import (
     get_credential_issuer_metadata as fetch_credential_issuer_metadata,
 )
 from mcp_oidc4vci.credential_offer import InvalidCredentialOfferError, resolve_credential_offer
+from mcp_oidc4vci.credential_request import SessionNotReadyError
+from mcp_oidc4vci.credential_request import request_credential as fetch_credential
 from mcp_oidc4vci.issuance import (
     IssuanceSession,
     IssuanceSessionNotFoundError,
@@ -18,9 +20,11 @@ from mcp_oidc4vci.issuance import (
 )
 from mcp_oidc4vci.issuance import describe_issuance_flow as build_issuance_flow_description
 from mcp_oidc4vci.issuance import initiate_issuance as start_issuance
+from mcp_oidc4vci.wallet import MockWalletAdapter
 
 mcp = FastMCP(name="oidc4vci")
 _sessions = IssuanceSessionStore()
+_wallet = MockWalletAdapter()
 
 
 @mcp.tool
@@ -87,6 +91,21 @@ async def get_issuance_status(session_id: str) -> dict[str, Any]:
     try:
         session = await _sessions.get(session_id)
     except IssuanceSessionNotFoundError as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
+@mcp.tool
+async def request_credential(session_id: str) -> dict[str, Any]:
+    """Complete the Credential Request for a session that has an access token.
+
+    Generates a key proof of possession through the wallet adapter — this server never
+    signs anything itself — and hands the issued credential to the wallet for safekeeping.
+    Its contents are never returned to the agent.
+    """
+    try:
+        session = await fetch_credential(session_id, sessions=_sessions, wallet=_wallet)
+    except (IssuanceSessionNotFoundError, SessionNotReadyError) as exc:
         raise ToolError(str(exc)) from exc
     return _issuance_session_output(session)
 

@@ -898,8 +898,10 @@ name = "mcp-oidc4vci"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "fastmcp" },
     { name = "httpx" },
+    { name = "pyjwt" },
 ]
 
 [package.dev-dependencies]
@@ -913,8 +915,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=50.0.1" },
     { name = "fastmcp", specifier = ">=3.4.7" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "pyjwt", specifier = ">=2.13.0" },
 ]
 
 [package.metadata.requires-dev]

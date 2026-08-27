@@ -87,6 +87,7 @@ class CredentialIssuerMetadata(BaseModel):
     credential_issuer: str
     credential_endpoint: str
     authorization_servers: list[str] | None = None
+    nonce_endpoint: str | None = None
     credential_configurations_supported: dict[str, CredentialConfiguration]
 
 
@@ -126,3 +127,31 @@ class IssuanceFlowDescription(BaseModel):
 
     flow_type: str
     steps: list[IssuanceFlowStep]
+
+
+class NonceResponse(BaseModel):
+    """A Nonce Response (spec "Nonce Response")."""
+
+    c_nonce: str
+
+
+class IssuedCredential(BaseModel):
+    """One element of a Credential Response's `credentials` array."""
+
+    credential: str | dict[str, object]
+
+
+class CredentialResponse(BaseModel):
+    """A Credential Response (spec "Credential Response"), immediate or deferred."""
+
+    credentials: list[IssuedCredential] | None = None
+    transaction_id: str | None = None
+    interval: int | None = None
+    notification_id: str | None = None
+
+
+class CredentialErrorResponse(BaseModel):
+    """A Credential Error Response (spec "Credential Error Response")."""
+
+    error: str
+    error_description: str | None = None

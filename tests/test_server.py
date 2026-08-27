@@ -181,3 +181,83 @@ async def test_get_issuance_status_surfaces_an_unknown_session_as_a_tool_error()
     async with Client(mcp) as client:
         with pytest.raises(ToolError, match="No issuance session"):
             await client.call_tool("get_issuance_status", {"session_id": "does-not-exist"})
+
+
+async def test_request_credential_completes_the_full_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/credential":
+            return httpx.Response(200, json={"credentials": [{"credential": "opaque-jwt-vc"}]})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        assert initiate_result.data["status"] == "ready_for_credential_request"
+
+        request_result = await client.call_tool(
+            "request_credential", {"session_id": initiate_result.data["session_id"]}
+        )
+
+    assert request_result.data == {
+        "session_id": initiate_result.data["session_id"],
+        "status": "completed",
+    }
+
+
+async def test_request_credential_surfaces_an_unknown_session_as_a_tool_error() -> None:
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="No issuance session"):
+            await client.call_tool("request_credential", {"session_id": "does-not-exist"})
+
+
+async def test_request_credential_surfaces_a_not_ready_session_as_a_tool_error() -> None:
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"authorization_code": {}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        assert initiate_result.data["status"] == "waiting_for_user_authorization"
+
+        with pytest.raises(ToolError, match="not ready"):
+            await client.call_tool(
+                "request_credential", {"session_id": initiate_result.data["session_id"]}
+            )
