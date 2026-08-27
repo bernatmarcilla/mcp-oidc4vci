@@ -169,6 +169,23 @@ async def test_session_store_update_changes_status_and_error() -> None:
     assert updated.error == "boom"
 
 
+async def test_session_store_update_sets_and_clears_proof_nonce() -> None:
+    store = IssuanceSessionStore()
+    session = await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    awaiting = await store.update(
+        session.session_id, status="awaiting_wallet_proof", proof_nonce="fresh-nonce"
+    )
+    assert awaiting.proof_nonce == "fresh-nonce"
+
+    completed = await store.update(session.session_id, status="completed")
+    assert completed.proof_nonce is None
+
+
 async def test_session_store_get_raises_for_an_unknown_session() -> None:
     with pytest.raises(IssuanceSessionNotFoundError):
         await IssuanceSessionStore().get("does-not-exist")

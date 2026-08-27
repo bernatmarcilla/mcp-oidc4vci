@@ -115,6 +115,8 @@ class IssuanceSession:
 
     `access_token` is intentionally never surfaced by `get_issuance_status` — it stays
     server-side per the "MCP exposes capabilities, not raw secrets" design principle.
+    `proof_nonce` only has a value while `status == "awaiting_wallet_proof"` — the manual
+    proof handoff between `request_wallet_proof` and `submit_wallet_proof`.
     """
 
     session_id: str
@@ -124,6 +126,7 @@ class IssuanceSession:
     status: str
     error: str | None = None
     access_token: str | None = None
+    proof_nonce: str | None = None
 
 
 class IssuanceSessionStore:
@@ -158,6 +161,7 @@ class IssuanceSessionStore:
         status: str,
         error: str | None = None,
         access_token: str | None = None,
+        proof_nonce: str | None = None,
     ) -> IssuanceSession:
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -165,6 +169,7 @@ class IssuanceSessionStore:
                 raise IssuanceSessionNotFoundError(f"No issuance session found for {session_id!r}.")
             session.status = status
             session.error = error
+            session.proof_nonce = proof_nonce
             if access_token is not None:
                 session.access_token = access_token
             return session

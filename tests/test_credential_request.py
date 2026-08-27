@@ -6,6 +6,8 @@ from mcp_oidc4vci.credential_request import (
     CredentialRequestRejectedError,
     SessionNotReadyError,
     request_credential,
+    request_wallet_proof,
+    submit_wallet_proof,
 )
 from mcp_oidc4vci.issuance import (
     AUTHORIZATION_CODE_FLOW,
@@ -402,3 +404,184 @@ async def test_raises_credential_request_rejected_error_directly_for_a_well_form
     assert exc.error == "invalid_proof"
     assert exc.error_description == "proof nonce expired"
     assert str(exc) == "proof nonce expired"
+
+
+# -- request_wallet_proof / submit_wallet_proof: the manual two-step path -----
+
+
+async def _awaiting_proof_session(sessions: IssuanceSessionStore) -> str:
+    session_id = await _ready_session(sessions)
+    await request_wallet_proof(
+        session_id, sessions=sessions, fetch_issuer_metadata=_fetch_default_issuer_metadata
+    )
+    return session_id
+
+
+async def test_request_wallet_proof_moves_the_session_to_awaiting_without_signing_anything() -> (
+    None
+):
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+
+    session = await request_wallet_proof(
+        session_id, sessions=sessions, fetch_issuer_metadata=_fetch_default_issuer_metadata
+    )
+
+    assert session.status == "awaiting_wallet_proof"
+    assert session.proof_nonce is None
+
+
+async def test_request_wallet_proof_records_the_nonce_when_the_issuer_has_one() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+
+    async def fake_issuer_metadata(url: str) -> str:
+        return _issuer_metadata_json(nonce_endpoint=f"{ISSUER}/nonce")
+
+    async def fake_nonce(url: str) -> tuple[int, str]:
+        return 200, '{"c_nonce": "fresh-nonce"}'
+
+    session = await request_wallet_proof(
+        session_id,
+        sessions=sessions,
+        fetch_issuer_metadata=fake_issuer_metadata,
+        fetch_nonce=fake_nonce,
+    )
+
+    assert session.status == "awaiting_wallet_proof"
+    assert session.proof_nonce == "fresh-nonce"
+
+
+async def test_request_wallet_proof_raises_when_the_session_is_not_ready() -> None:
+    sessions = IssuanceSessionStore()
+    session = await sessions.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["UniversityDegreeCredential"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+    await sessions.update(session.session_id, status="waiting_for_user_authorization")
+
+    with pytest.raises(SessionNotReadyError):
+        await request_wallet_proof(session.session_id, sessions=sessions)
+
+
+async def test_request_wallet_proof_fails_the_session_when_issuer_metadata_is_invalid() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+
+    async def broken_metadata(url: str) -> str:
+        return "not-json"
+
+    session = await request_wallet_proof(
+        session_id, sessions=sessions, fetch_issuer_metadata=broken_metadata
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+
+
+async def test_submit_wallet_proof_raises_when_the_session_is_not_awaiting_a_proof() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+
+    with pytest.raises(SessionNotReadyError):
+        await submit_wallet_proof(
+            session_id, "externally-signed-jwt", sessions=sessions, wallet=MockWalletAdapter()
+        )
+
+
+async def test_submit_wallet_proof_completes_the_request_without_asking_the_wallet_to_sign() -> (
+    None
+):
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_proof_session(sessions)
+    captured_requests: list[tuple[str, dict[str, object], str]] = []
+
+    class RefusesToSignWallet(MockWalletAdapter):
+        async def generate_proof(self, *, audience: str, nonce: str | None) -> str:
+            raise AssertionError("submit_wallet_proof must not ask the wallet to sign")
+
+    async def fake_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
+        captured_requests.append((url, body, access_token))
+        return 200, '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
+
+    session = await submit_wallet_proof(
+        session_id,
+        "externally-signed-jwt",
+        sessions=sessions,
+        wallet=RefusesToSignWallet(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert session.status == "completed"
+    assert session.proof_nonce is None
+    assert len(captured_requests) == 1
+    _url, body, _token = captured_requests[0]
+    assert body["proofs"] == {"jwt": ["externally-signed-jwt"]}
+
+
+async def test_submit_wallet_proof_hands_the_credential_to_the_wallet() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_proof_session(sessions)
+    wallet = MockWalletAdapter()
+
+    async def fake_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
+        return 200, '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
+
+    await submit_wallet_proof(
+        session_id,
+        "externally-signed-jwt",
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert wallet.received_credentials == [
+        {
+            "credential_configuration_id": "UniversityDegreeCredential",
+            "credential": "opaque-jwt-vc",
+        }
+    ]
+
+
+async def test_submit_wallet_proof_fails_the_session_when_issuer_metadata_is_invalid() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_proof_session(sessions)
+
+    async def broken_metadata(url: str) -> str:
+        return "not-json"
+
+    session = await submit_wallet_proof(
+        session_id,
+        "externally-signed-jwt",
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=broken_metadata,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+
+
+async def test_submit_wallet_proof_fails_the_session_when_the_request_is_rejected() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_proof_session(sessions)
+
+    async def rejecting_post(
+        url: str, body: dict[str, object], access_token: str
+    ) -> tuple[int, str]:
+        return 400, '{"error": "invalid_proof", "error_description": "signature did not verify"}'
+
+    session = await submit_wallet_proof(
+        session_id,
+        "externally-signed-jwt",
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=rejecting_post,
+    )
+
+    assert session.status == "failed"
+    assert session.error == "signature did not verify"

@@ -261,3 +261,91 @@ async def test_request_credential_surfaces_a_not_ready_session_as_a_tool_error()
             await client.call_tool(
                 "request_credential", {"session_id": initiate_result.data["session_id"]}
             )
+
+
+async def test_manual_wallet_proof_completes_the_full_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "nonce_endpoint": "https://issuer.example.com/nonce",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/nonce":
+            return httpx.Response(200, json={"c_nonce": "fresh-nonce"})
+        if request.method == "POST" and path == "/credential":
+            return httpx.Response(200, json={"credentials": [{"credential": "opaque-jwt-vc"}]})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        session_id = initiate_result.data["session_id"]
+
+        proof_result = await client.call_tool("request_wallet_proof", {"session_id": session_id})
+        assert proof_result.data == {
+            "session_id": session_id,
+            "status": "awaiting_wallet_proof",
+            "proof_request": {"audience": "https://issuer.example.com", "nonce": "fresh-nonce"},
+        }
+
+        submit_result = await client.call_tool(
+            "submit_wallet_proof",
+            {"session_id": session_id, "proof_jwt": "externally-signed-proof"},
+        )
+
+    assert submit_result.data == {"session_id": session_id, "status": "completed"}
+
+
+async def test_request_wallet_proof_surfaces_a_not_ready_session_as_a_tool_error() -> None:
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="No issuance session"):
+            await client.call_tool("request_wallet_proof", {"session_id": "does-not-exist"})
+
+
+async def test_submit_wallet_proof_surfaces_a_not_awaiting_session_as_a_tool_error() -> None:
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"authorization_code": {}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        session_id = initiate_result.data["session_id"]
+
+        with pytest.raises(ToolError, match="not ready"):
+            await client.call_tool(
+                "submit_wallet_proof", {"session_id": session_id, "proof_jwt": "x"}
+            )

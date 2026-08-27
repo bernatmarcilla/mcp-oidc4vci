@@ -16,7 +16,11 @@ from mcp_oidc4vci.credential_issuer_metadata import (
     get_credential_issuer_metadata,
 )
 from mcp_oidc4vci.issuance import IssuanceSession, IssuanceSessionStore
-from mcp_oidc4vci.models import CredentialErrorResponse, CredentialResponse
+from mcp_oidc4vci.models import (
+    CredentialErrorResponse,
+    CredentialIssuerMetadata,
+    CredentialResponse,
+)
 from mcp_oidc4vci.nonce import InvalidNonceResponseError, NoncePoster, request_nonce
 from mcp_oidc4vci.wallet import WalletAdapter
 
@@ -55,34 +59,152 @@ async def request_credential(
     fetch_nonce: NoncePoster | None = None,
     post_credential_request: CredentialRequester | None = None,
 ) -> IssuanceSession:
-    """Complete the Credential Request for a session that already has an access token.
+    """Complete the Credential Request for a session that already has an access token,
+    automatically, using the configured `WalletAdapter` to produce the proof.
 
     Requests a fresh `c_nonce` when the issuer has a Nonce Endpoint, asks the wallet to
     generate a proof of possession over it, sends the Credential Request, and hands each
     issued credential to the wallet. The session ends `completed` or `failed` — the
     credential's content is never returned to the caller.
+
+    Use `request_wallet_proof` / `submit_wallet_proof` instead when the proof must be
+    produced by something outside this process (e.g. a real wallet) rather than
+    synchronously by an in-process `WalletAdapter`.
     """
     session = await sessions.get(session_id)
-    if session.status != "ready_for_credential_request" or session.access_token is None:
-        raise SessionNotReadyError(
-            f"Session {session_id!r} is not ready for a credential request "
-            f"(status: {session.status!r})."
-        )
+    _require_status(session, "ready_for_credential_request", need_access_token=True)
 
     try:
-        response = await _perform_credential_request(
-            session,
-            wallet,
-            fetch_issuer_metadata=fetch_issuer_metadata,
-            fetch_nonce=fetch_nonce,
-            post_credential_request=post_credential_request,
+        issuer_metadata, c_nonce = await _prepare_proof_request(
+            session, fetch_issuer_metadata=fetch_issuer_metadata, fetch_nonce=fetch_nonce
         )
-    except (
-        InvalidCredentialIssuerMetadataError,
-        InvalidNonceResponseError,
-        CredentialRequestRejectedError,
-        InvalidCredentialResponseError,
-    ) as exc:
+        proof = await wallet.generate_proof(audience=session.credential_issuer, nonce=c_nonce)
+    except (InvalidCredentialIssuerMetadataError, InvalidNonceResponseError) as exc:
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    return await _send_credential_request(
+        session,
+        issuer_metadata.credential_endpoint,
+        proof,
+        wallet,
+        sessions,
+        post_credential_request=post_credential_request,
+    )
+
+
+async def request_wallet_proof(
+    session_id: str,
+    *,
+    sessions: IssuanceSessionStore,
+    fetch_issuer_metadata: MetadataFetcher | None = None,
+    fetch_nonce: NoncePoster | None = None,
+) -> IssuanceSession:
+    """Manual path, step 1 of 2: describe what needs signing, without asking a
+    `WalletAdapter` to sign it automatically.
+
+    Moves the session to `awaiting_wallet_proof` and records the audience/nonce to sign
+    (surfaced by the caller alongside `session_id`/`status`). Pairs with
+    `submit_wallet_proof`, which completes the Credential Request once a proof produced
+    outside this process — by a real wallet, or by hand for testing — is available.
+    """
+    session = await sessions.get(session_id)
+    _require_status(session, "ready_for_credential_request", need_access_token=True)
+
+    try:
+        _issuer_metadata, c_nonce = await _prepare_proof_request(
+            session, fetch_issuer_metadata=fetch_issuer_metadata, fetch_nonce=fetch_nonce
+        )
+    except (InvalidCredentialIssuerMetadataError, InvalidNonceResponseError) as exc:
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    return await sessions.update(
+        session.session_id, status="awaiting_wallet_proof", proof_nonce=c_nonce
+    )
+
+
+async def submit_wallet_proof(
+    session_id: str,
+    proof_jwt: str,
+    *,
+    sessions: IssuanceSessionStore,
+    wallet: WalletAdapter,
+    fetch_issuer_metadata: MetadataFetcher | None = None,
+    post_credential_request: CredentialRequester | None = None,
+) -> IssuanceSession:
+    """Manual path, step 2 of 2: complete the Credential Request with a proof produced
+    outside this server, in response to `request_wallet_proof`.
+
+    Still hands the issued credential to `wallet.receive_credential` — that part of the
+    boundary applies regardless of who signed the proof.
+    """
+    session = await sessions.get(session_id)
+    _require_status(session, "awaiting_wallet_proof")
+
+    try:
+        issuer_metadata = await get_credential_issuer_metadata(
+            session.credential_issuer, fetch=fetch_issuer_metadata
+        )
+    except InvalidCredentialIssuerMetadataError as exc:
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    return await _send_credential_request(
+        session,
+        issuer_metadata.credential_endpoint,
+        proof_jwt,
+        wallet,
+        sessions,
+        post_credential_request=post_credential_request,
+    )
+
+
+def _require_status(
+    session: IssuanceSession, expected_status: str, *, need_access_token: bool = False
+) -> None:
+    if session.status != expected_status or (need_access_token and session.access_token is None):
+        raise SessionNotReadyError(
+            f"Session {session.session_id!r} is not ready (expected status "
+            f"{expected_status!r}, has {session.status!r})."
+        )
+
+
+async def _prepare_proof_request(
+    session: IssuanceSession,
+    *,
+    fetch_issuer_metadata: MetadataFetcher | None,
+    fetch_nonce: NoncePoster | None,
+) -> tuple[CredentialIssuerMetadata, str | None]:
+    issuer_metadata = await get_credential_issuer_metadata(
+        session.credential_issuer, fetch=fetch_issuer_metadata
+    )
+    c_nonce = None
+    if issuer_metadata.nonce_endpoint is not None:
+        c_nonce = await request_nonce(issuer_metadata.nonce_endpoint, post=fetch_nonce)
+    return issuer_metadata, c_nonce
+
+
+async def _send_credential_request(
+    session: IssuanceSession,
+    credential_endpoint: str,
+    proof: str,
+    wallet: WalletAdapter,
+    sessions: IssuanceSessionStore,
+    *,
+    post_credential_request: CredentialRequester | None,
+) -> IssuanceSession:
+    assert session.access_token is not None
+    credential_configuration_id = session.credential_configuration_ids[0]
+
+    try:
+        status_code, body = await (post_credential_request or _post_credential_request)(
+            credential_endpoint,
+            {
+                "credential_configuration_id": credential_configuration_id,
+                "proofs": {"jwt": [proof]},
+            },
+            session.access_token,
+        )
+        response = _parse_credential_response(status_code, body)
+    except (CredentialRequestRejectedError, InvalidCredentialResponseError) as exc:
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
     if response.transaction_id is not None:
@@ -94,39 +216,12 @@ async def request_credential(
 
     # _parse_credential_response guarantees credentials is set whenever transaction_id isn't.
     assert response.credentials is not None
-    credential_configuration_id = session.credential_configuration_ids[0]
     for issued in response.credentials:
         await wallet.receive_credential(
             credential_configuration_id=credential_configuration_id, credential=issued.credential
         )
 
     return await sessions.update(session.session_id, status="completed")
-
-
-async def _perform_credential_request(
-    session: IssuanceSession,
-    wallet: WalletAdapter,
-    *,
-    fetch_issuer_metadata: MetadataFetcher | None,
-    fetch_nonce: NoncePoster | None,
-    post_credential_request: CredentialRequester | None,
-) -> CredentialResponse:
-    assert session.access_token is not None
-    issuer_metadata = await get_credential_issuer_metadata(
-        session.credential_issuer, fetch=fetch_issuer_metadata
-    )
-    c_nonce = None
-    if issuer_metadata.nonce_endpoint is not None:
-        c_nonce = await request_nonce(issuer_metadata.nonce_endpoint, post=fetch_nonce)
-
-    proof = await wallet.generate_proof(audience=session.credential_issuer, nonce=c_nonce)
-    credential_configuration_id = session.credential_configuration_ids[0]
-    status_code, body = await (post_credential_request or _post_credential_request)(
-        issuer_metadata.credential_endpoint,
-        {"credential_configuration_id": credential_configuration_id, "proofs": {"jwt": [proof]}},
-        session.access_token,
-    )
-    return _parse_credential_response(status_code, body)
 
 
 def _parse_credential_response(status_code: int, body: str) -> CredentialResponse:

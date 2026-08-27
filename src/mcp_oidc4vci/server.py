@@ -12,6 +12,8 @@ from mcp_oidc4vci.credential_issuer_metadata import (
 from mcp_oidc4vci.credential_offer import InvalidCredentialOfferError, resolve_credential_offer
 from mcp_oidc4vci.credential_request import SessionNotReadyError
 from mcp_oidc4vci.credential_request import request_credential as fetch_credential
+from mcp_oidc4vci.credential_request import request_wallet_proof as begin_wallet_proof
+from mcp_oidc4vci.credential_request import submit_wallet_proof as finish_wallet_proof
 from mcp_oidc4vci.issuance import (
     IssuanceSession,
     IssuanceSessionNotFoundError,
@@ -110,10 +112,49 @@ async def request_credential(session_id: str) -> dict[str, Any]:
     return _issuance_session_output(session)
 
 
+@mcp.tool
+async def request_wallet_proof(session_id: str) -> dict[str, Any]:
+    """Ask what needs to be signed to complete a Credential Request, without asking any
+    wallet adapter to sign it automatically.
+
+    Use this instead of request_credential when the proof must be produced by something
+    outside this server — a real wallet, or a human signing by hand. Returns the audience
+    and (if the issuer requires one) nonce to sign; the session moves to
+    `awaiting_wallet_proof`. Call submit_wallet_proof with the result once you have it.
+    """
+    try:
+        session = await begin_wallet_proof(session_id, sessions=_sessions)
+    except (IssuanceSessionNotFoundError, SessionNotReadyError) as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
+@mcp.tool
+async def submit_wallet_proof(session_id: str, proof_jwt: str) -> dict[str, Any]:
+    """Complete a Credential Request using a proof produced outside this server, in
+    response to request_wallet_proof.
+
+    Hands the issued credential to the wallet adapter for safekeeping, same as
+    request_credential — its contents are never returned to the agent.
+    """
+    try:
+        session = await finish_wallet_proof(
+            session_id, proof_jwt, sessions=_sessions, wallet=_wallet
+        )
+    except (IssuanceSessionNotFoundError, SessionNotReadyError) as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
 def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
     output: dict[str, Any] = {"session_id": session.session_id, "status": session.status}
     if session.error is not None:
         output["error"] = session.error
+    if session.status == "awaiting_wallet_proof":
+        proof_request: dict[str, Any] = {"audience": session.credential_issuer}
+        if session.proof_nonce is not None:
+            proof_request["nonce"] = session.proof_nonce
+        output["proof_request"] = proof_request
     return output
 
 
