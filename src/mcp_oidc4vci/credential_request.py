@@ -5,6 +5,7 @@ one issued credential for a session that has already completed a Token Request.
 """
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -23,6 +24,8 @@ from mcp_oidc4vci.models import (
 )
 from mcp_oidc4vci.nonce import InvalidNonceResponseError, NoncePoster, request_nonce
 from mcp_oidc4vci.wallet import WalletAdapter
+
+logger = logging.getLogger(__name__)
 
 # (url, json_body, headers) -> (status_code, response_headers, body). Response header keys
 # are lowercased, matching HTTP's case-insensitive header names.
@@ -209,6 +212,7 @@ async def _send_credential_request(
         )
         response = _parse_credential_response(status_code, response_body)
     except (CredentialRequestRejectedError, InvalidCredentialResponseError) as exc:
+        logger.warning("Session %s failed during credential request: %s", session.session_id, exc)
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
     if response.transaction_id is not None:
@@ -225,6 +229,12 @@ async def _send_credential_request(
             credential_configuration_id=credential_configuration_id, credential=issued.credential
         )
 
+    logger.info(
+        "Session %s completed; %d credential(s) issued for %r.",
+        session.session_id,
+        len(response.credentials),
+        credential_configuration_id,
+    )
     return await sessions.update(session.session_id, status="completed")
 
 
@@ -244,9 +254,12 @@ def _parse_credential_response(status_code: int, body: str) -> CredentialRespons
                 f"Credential endpoint success response does not match the expected structure: {exc}"
             ) from exc
         if response.credentials is None and response.transaction_id is None:
+            # Field names only (never values) — enough to diagnose a shape mismatch against a
+            # real issuer without risking leaking credential content into an error message.
+            present_fields = sorted(payload) if isinstance(payload, dict) else []
             raise InvalidCredentialResponseError(
                 "Credential endpoint success response contains neither 'credentials' nor "
-                "'transaction_id'."
+                f"'transaction_id'. Response had top-level fields: {present_fields}."
             )
         return response
 
@@ -254,7 +267,8 @@ def _parse_credential_response(status_code: int, body: str) -> CredentialRespons
         error = CredentialErrorResponse.model_validate(payload)
     except ValidationError as exc:
         raise InvalidCredentialResponseError(
-            f"Credential endpoint error response does not match the expected structure: {exc}"
+            f"Credential endpoint returned HTTP {status_code} with a body that does not "
+            f"match the expected error structure: {exc}"
         ) from exc
     raise CredentialRequestRejectedError(error.error, error.error_description)
 
@@ -300,6 +314,10 @@ async def _post_with_dpop(
         )
         new_nonce = response_headers.get("dpop-nonce")
         if needs_retry and new_nonce:
+            logger.info(
+                "Credential endpoint %r demanded a DPoP nonce; retrying with the supplied nonce.",
+                url,
+            )
             dpop_nonce = new_nonce
             continue
         return status_code, response_body

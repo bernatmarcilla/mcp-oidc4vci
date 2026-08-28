@@ -6,8 +6,11 @@ one issuance (`initiate_issuance` followed by one or more `get_issuance_status` 
 """
 
 import asyncio
+import logging
+import time
 import uuid
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from mcp_oidc4vci.authorization_server_metadata import (
     InvalidAuthorizationServerMetadataError,
@@ -30,7 +33,10 @@ from mcp_oidc4vci.token_request import (
     request_token_with_pre_authorized_code,
 )
 
+logger = logging.getLogger(__name__)
+
 AUTHORIZATION_CODE_FLOW = "authorization_code"
+DEFAULT_SESSION_TTL_SECONDS = 3600.0
 
 _FLOW_STEPS: dict[str, list[IssuanceFlowStep]] = {
     AUTHORIZATION_CODE_FLOW: [
@@ -134,18 +140,42 @@ class IssuanceSession:
     proof_nonce: str | None = None
     dpop_key: DPoPKey | None = None
     dpop_bound: bool = False
+    created_at: float = field(default_factory=time.monotonic)
 
 
 class IssuanceSessionStore:
     """In-memory issuance session store, keyed by session_id.
 
     Process-local: sessions do not survive a server restart and are not shared across
-    server instances. Sufficient for the current single-process MVP.
+    server instances. Sufficient for the current single-process MVP. Sessions older than
+    `ttl_seconds` (measured from creation, not last access) are evicted lazily on the next
+    store operation rather than by a background sweep — a session's natural lifetime is one
+    issuance flow, so there's no need to poll for expiry between calls. An expired
+    session_id behaves exactly like an unknown one.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._sessions: dict[str, IssuanceSession] = {}
         self._lock = asyncio.Lock()
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+
+    def _evict_expired_locked(self) -> None:
+        now = self._clock()
+        expired = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if now - session.created_at > self._ttl_seconds
+        ]
+        for session_id in expired:
+            del self._sessions[session_id]
+        if expired:
+            logger.info("Evicted %d expired issuance session(s).", len(expired))
 
     async def create(
         self, *, credential_issuer: str, credential_configuration_ids: list[str], flow_type: str
@@ -156,9 +186,17 @@ class IssuanceSessionStore:
             credential_configuration_ids=credential_configuration_ids,
             flow_type=flow_type,
             status="created",
+            created_at=self._clock(),
         )
         async with self._lock:
+            self._evict_expired_locked()
             self._sessions[session.session_id] = session
+        logger.info(
+            "Created issuance session %s for issuer %r (flow=%r).",
+            session.session_id,
+            credential_issuer,
+            flow_type,
+        )
         return session
 
     async def update(
@@ -173,6 +211,7 @@ class IssuanceSessionStore:
         dpop_bound: bool | None = None,
     ) -> IssuanceSession:
         async with self._lock:
+            self._evict_expired_locked()
             session = self._sessions.get(session_id)
             if session is None:
                 raise IssuanceSessionNotFoundError(f"No issuance session found for {session_id!r}.")
@@ -189,6 +228,7 @@ class IssuanceSessionStore:
 
     async def get(self, session_id: str) -> IssuanceSession:
         async with self._lock:
+            self._evict_expired_locked()
             session = self._sessions.get(session_id)
         if session is None:
             raise IssuanceSessionNotFoundError(f"No issuance session found for {session_id!r}.")
@@ -274,8 +314,14 @@ async def _complete_pre_authorized_code_flow(
         TokenRequestRejectedError,
         InvalidTokenResponseError,
     ) as exc:
+        logger.warning("Session %s failed during token exchange: %s", session.session_id, exc)
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
+    logger.info(
+        "Session %s obtained an access token (dpop_bound=%s).",
+        session.session_id,
+        token.token_type == "DPoP",
+    )
     return await sessions.update(
         session.session_id,
         status="ready_for_credential_request",

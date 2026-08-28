@@ -1,6 +1,7 @@
 """OAuth 2.0 Token Request for the pre-authorized code grant (spec "Token Request")."""
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -12,6 +13,8 @@ from mcp_oidc4vci.models import (
     TokenErrorResponse,
     TokenSuccessResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 # (url, form_data, extra_headers) -> (status_code, response_headers, body). Response header
 # keys are lowercased, matching HTTP's case-insensitive header names.
@@ -104,8 +107,13 @@ async def request_token_with_pre_authorized_code(
 
         new_nonce = response_headers.get("dpop-nonce")
         if error.error == _DPOP_NONCE_ERROR and dpop_key is not None and attempt == 0 and new_nonce:
+            logger.info(
+                "Token endpoint %r demanded a DPoP nonce; retrying with the supplied nonce.",
+                token_endpoint,
+            )
             dpop_nonce = new_nonce
             continue
+        logger.warning("Token Request to %r rejected: %s", token_endpoint, error.error)
         raise TokenRequestRejectedError(error.error, error.error_description)
 
     raise InvalidTokenResponseError("Token endpoint kept demanding a new DPoP nonce.")

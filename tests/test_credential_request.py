@@ -218,6 +218,33 @@ async def test_hands_each_issued_credential_to_the_wallet() -> None:
     ]
 
 
+async def test_rejects_the_pre_final_singular_credential_shape() -> None:
+    # This project targets v1.0 strictly (see docs/ARCHITECTURE.md). Some issuers (e.g.
+    # Namirial's dev gateway) still return this pre-final draft shape instead of the v1.0
+    # `credentials` array — it must be reported clearly as non-conformant, not accepted.
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+    wallet = MockWalletAdapter()
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 200, {}, '{"credential": "vc-jwt", "notification_id": "abc"}'
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+    assert "['credential', 'notification_id']" in session.error
+    assert wallet.received_credentials == []
+
+
 # -- failure paths ----------------------------------------------------------------
 
 
@@ -313,21 +340,25 @@ async def test_fails_the_session_for_a_success_response_with_neither_field_prese
     sessions = IssuanceSessionStore()
     session_id = await _ready_session(sessions)
 
-    async def empty_post(
+    async def unexpected_shape_post(
         url: str, body: dict[str, object], headers: dict[str, str]
     ) -> tuple[int, dict[str, str], str]:
-        return 200, {}, "{}"
+        # Neither the v1.0 'credentials' array nor the pre-final 'credential' field we also
+        # accept — field *names* only, chosen to be obviously not real credential data, since
+        # the point of this test is that they end up in the error message, not their content.
+        return 200, {}, '{"totally_unexpected_field": "not-a-real-shape"}'
 
     session = await request_credential(
         session_id,
         sessions=sessions,
         wallet=MockWalletAdapter(),
         fetch_issuer_metadata=_fetch_default_issuer_metadata,
-        post_credential_request=empty_post,
+        post_credential_request=unexpected_shape_post,
     )
 
     assert session.status == "failed"
     assert session.error is not None
+    assert "['totally_unexpected_field']" in session.error
 
 
 async def test_fails_the_session_when_the_response_body_is_not_valid_json() -> None:

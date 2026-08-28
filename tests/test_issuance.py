@@ -198,6 +198,71 @@ async def test_session_store_update_raises_for_an_unknown_session() -> None:
         await IssuanceSessionStore().update("does-not-exist", status="failed")
 
 
+async def test_session_store_get_raises_for_a_session_past_its_ttl() -> None:
+    now = 0.0
+    store = IssuanceSessionStore(ttl_seconds=10.0, clock=lambda: now)
+    session = await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    now = 5.0
+    assert (await store.get(session.session_id)).session_id == session.session_id
+
+    now = 11.0
+    with pytest.raises(IssuanceSessionNotFoundError):
+        await store.get(session.session_id)
+
+
+async def test_session_store_update_raises_for_a_session_past_its_ttl() -> None:
+    now = 0.0
+    store = IssuanceSessionStore(ttl_seconds=10.0, clock=lambda: now)
+    session = await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    now = 11.0
+    with pytest.raises(IssuanceSessionNotFoundError):
+        await store.update(session.session_id, status="failed")
+
+
+async def test_session_store_evicts_expired_sessions_as_a_side_effect_of_create() -> None:
+    now = 0.0
+    store = IssuanceSessionStore(ttl_seconds=10.0, clock=lambda: now)
+    expired = await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    now = 11.0
+    await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["y"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    assert expired.session_id not in store._sessions
+
+
+async def test_session_store_does_not_evict_sessions_within_their_ttl() -> None:
+    now = 0.0
+    store = IssuanceSessionStore(ttl_seconds=10.0, clock=lambda: now)
+    session = await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    now = 10.0
+    await store.get(session.session_id)
+
+    assert session.session_id in store._sessions
+
+
 # -- initiate_issuance: authorization_code grant ------------------------------
 
 

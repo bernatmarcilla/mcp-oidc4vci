@@ -5,6 +5,7 @@ on, per OIDC4VCI's `authorization_servers` Credential Issuer Metadata parameter.
 """
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -12,6 +13,8 @@ import httpx
 from pydantic import ValidationError
 
 from mcp_oidc4vci.models import AuthorizationServerMetadata
+
+logger = logging.getLogger(__name__)
 
 MetadataFetcher = Callable[[str], Awaitable[str]]
 
@@ -87,11 +90,14 @@ def _verify_issuer_identity(metadata: AuthorizationServerMetadata, requested_iss
 async def _fetch_metadata(url: str, fetch: MetadataFetcher) -> str:
     # Normalize failures from *any* fetcher (default or caller-supplied) to one error type,
     # so callers only ever need to handle InvalidAuthorizationServerMetadataError.
+    logger.debug("Fetching Authorization Server Metadata from %r.", url)
     try:
         return await fetch(url)
     except InvalidAuthorizationServerMetadataError:
+        logger.warning("Authorization Server Metadata at %r is invalid.", url)
         raise
     except Exception as exc:
+        logger.warning("Failed to fetch Authorization Server Metadata from %r: %s", url, exc)
         raise InvalidAuthorizationServerMetadataError(
             f"Failed to fetch metadata from {url!r}: {exc}"
         ) from exc

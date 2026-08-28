@@ -1,6 +1,7 @@
 """Retrieval of OIDC4VCI Credential Issuer Metadata (spec "Credential Issuer Metadata")."""
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -8,6 +9,8 @@ import httpx
 from pydantic import ValidationError
 
 from mcp_oidc4vci.models import CredentialIssuerMetadata
+
+logger = logging.getLogger(__name__)
 
 MetadataFetcher = Callable[[str], Awaitable[str]]
 
@@ -82,11 +85,14 @@ def _verify_issuer_identity(metadata: CredentialIssuerMetadata, requested_issuer
 async def _fetch_metadata(url: str, fetch: MetadataFetcher) -> str:
     # Normalize failures from *any* fetcher (default or caller-supplied) to one error type,
     # so callers only ever need to handle InvalidCredentialIssuerMetadataError.
+    logger.debug("Fetching Credential Issuer Metadata from %r.", url)
     try:
         return await fetch(url)
     except InvalidCredentialIssuerMetadataError:
+        logger.warning("Credential Issuer Metadata at %r is invalid.", url)
         raise
     except Exception as exc:
+        logger.warning("Failed to fetch Credential Issuer Metadata from %r: %s", url, exc)
         raise InvalidCredentialIssuerMetadataError(
             f"Failed to fetch metadata from {url!r}: {exc}"
         ) from exc

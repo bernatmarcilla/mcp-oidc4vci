@@ -1,3 +1,6 @@
+import logging
+import os
+import sys
 from typing import Any
 
 from fastmcp import FastMCP
@@ -23,6 +26,11 @@ from mcp_oidc4vci.issuance import (
 from mcp_oidc4vci.issuance import describe_issuance_flow as build_issuance_flow_description
 from mcp_oidc4vci.issuance import initiate_issuance as start_issuance
 from mcp_oidc4vci.wallet import MockWalletAdapter
+
+logger = logging.getLogger(__name__)
+
+_DEBUG_TOOLS_ENV_VAR = "MCP_OIDC4VCI_DEBUG_TOOLS"
+_TRUTHY_VALUES = {"1", "true", "yes"}
 
 mcp = FastMCP(name="oidc4vci")
 _sessions = IssuanceSessionStore()
@@ -146,6 +154,34 @@ async def submit_wallet_proof(session_id: str, proof_jwt: str) -> dict[str, Any]
     return _issuance_session_output(session)
 
 
+def debug_inspect_mock_wallet_credentials() -> list[dict[str, Any]]:
+    """DEBUG ONLY: list credentials the in-process MockWalletAdapter has received.
+
+    Exists purely to inspect what a mock-wallet test run actually issued. This bypasses the
+    wallet boundary on purpose, and only works because this server's wallet happens to be a
+    MockWalletAdapter today — a real WalletAdapter would never expose this, since credential
+    content is meant to stay with the wallet and never return through this server to the
+    agent. Remove this tool once a real (non-mock) wallet is wired in.
+
+    Only registered as an MCP tool when MCP_OIDC4VCI_DEBUG_TOOLS is set to a truthy value
+    ("1", "true", or "yes") — otherwise it isn't even discoverable by a connected client.
+    """
+    return _wallet.received_credentials
+
+
+def _debug_tools_enabled() -> bool:
+    return os.environ.get(_DEBUG_TOOLS_ENV_VAR, "").strip().lower() in _TRUTHY_VALUES
+
+
+if _debug_tools_enabled():  # pragma: no cover -- exercised via mcp.add_tool in tests, not env
+    mcp.tool(debug_inspect_mock_wallet_credentials)
+    logger.warning(
+        "%s is enabled: debug_inspect_mock_wallet_credentials bypasses the wallet boundary "
+        "and should only be used for local testing.",
+        _DEBUG_TOOLS_ENV_VAR,
+    )
+
+
 def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
     output: dict[str, Any] = {"session_id": session.session_id, "status": session.status}
     if session.error is not None:
@@ -158,5 +194,16 @@ def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
     return output
 
 
+def _configure_logging() -> None:
+    # MCP servers typically talk to their client over stdio, so logs must go to stderr —
+    # anything on stdout would corrupt the JSON-RPC stream.
+    level_name = os.environ.get("MCP_OIDC4VCI_LOG_LEVEL", "INFO").strip().upper()
+    level = logging.getLevelNamesMapping().get(level_name, logging.INFO)
+    logging.basicConfig(
+        level=level, stream=sys.stderr, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+
+
 def main() -> None:
+    _configure_logging()
     mcp.run()

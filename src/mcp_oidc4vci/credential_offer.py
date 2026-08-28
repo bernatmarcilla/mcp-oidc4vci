@@ -1,6 +1,7 @@
 """Parsing and resolution of OIDC4VCI Credential Offers (spec §4.1)."""
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from urllib.parse import parse_qs, urlsplit
 
@@ -8,6 +9,8 @@ import httpx
 from pydantic import ValidationError
 
 from mcp_oidc4vci.models import CredentialOffer
+
+logger = logging.getLogger(__name__)
 
 CredentialOfferFetcher = Callable[[str], Awaitable[str]]
 
@@ -73,11 +76,14 @@ def _parse_credential_offer_payload(payload: str) -> CredentialOffer:
 async def _fetch_offer(url: str, fetch: CredentialOfferFetcher) -> str:
     # Normalize failures from *any* fetcher (default or caller-supplied) to one error type,
     # so callers only ever need to handle InvalidCredentialOfferError.
+    logger.debug("Fetching Credential Offer from %r.", url)
     try:
         return await fetch(url)
     except InvalidCredentialOfferError:
+        logger.warning("Credential Offer at %r is invalid.", url)
         raise
     except Exception as exc:
+        logger.warning("Failed to fetch credential_offer_uri %r: %s", url, exc)
         raise InvalidCredentialOfferError(
             f"Failed to fetch credential_offer_uri {url!r}: {exc}"
         ) from exc

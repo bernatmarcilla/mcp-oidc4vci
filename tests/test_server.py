@@ -5,7 +5,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
-from mcp_oidc4vci.server import mcp
+from mcp_oidc4vci.server import _debug_tools_enabled, debug_inspect_mock_wallet_credentials, mcp
 from support import mock_async_client
 
 BY_VALUE_OFFER_JSON = (
@@ -235,6 +235,99 @@ async def test_request_credential_completes_the_full_flow(monkeypatch: pytest.Mo
     assert request_result.data == {
         "session_id": initiate_result.data["session_id"],
         "status": "completed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("", False), ("0", False), ("false", False), ("1", True), ("True", True)],
+)
+def test_debug_tools_enabled_reads_the_env_var(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MCP_OIDC4VCI_DEBUG_TOOLS", raising=False)
+    else:
+        monkeypatch.setenv("MCP_OIDC4VCI_DEBUG_TOOLS", value)
+
+    assert _debug_tools_enabled() is expected
+
+
+async def test_debug_inspect_mock_wallet_credentials_is_not_registered_by_default() -> None:
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+
+    assert "debug_inspect_mock_wallet_credentials" not in {tool.name for tool in tools}
+
+
+async def test_debug_inspect_mock_wallet_credentials_reflects_what_request_credential_issued(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    # This tool is only registered when MCP_OIDC4VCI_DEBUG_TOOLS is set (see server.py); to
+    # test its behavior without depending on process-wide env state, register/unregister it
+    # on the shared `mcp` instance around just this test.
+    mcp.add_tool(debug_inspect_mock_wallet_credentials)
+    request.addfinalizer(
+        lambda: mcp.local_provider.remove_tool("debug_inspect_mock_wallet_credentials")
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/credential":
+            return httpx.Response(
+                200, json={"credentials": [{"credential": "debug-tool-test-credential"}]}
+            )
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "another-code"}}}'
+    )
+
+    async with Client(mcp) as client:
+        before = await client.call_tool("debug_inspect_mock_wallet_credentials", {})
+        credentials_before = len(before.data)
+
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        await client.call_tool(
+            "request_credential", {"session_id": initiate_result.data["session_id"]}
+        )
+
+        after = await client.call_tool("debug_inspect_mock_wallet_credentials", {})
+
+    assert len(after.data) == credentials_before + 1
+    assert after.data[-1] == {
+        "credential_configuration_id": "UniversityDegreeCredential",
+        "credential": "debug-tool-test-credential",
     }
 
 
