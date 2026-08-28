@@ -24,7 +24,7 @@ The central question this project explores is:
 
 > **How can OIDC4VCI capabilities be exposed to an AI agent through MCP without compromising the security boundaries of wallets and cryptographic key material?**
 
-For the full system design, see [Architecture](docs/ARCHITECTURE.md). For the planned build-out and current scope, see [Roadmap](docs/ROADMAP.md).
+For the full system design, see [Architecture](docs/ARCHITECTURE.md).
 
 ---
 
@@ -46,21 +46,21 @@ Full details, component responsibilities, data flows, tool contracts, and securi
 
 ---
 
-## Project status
+## Current capabilities
 
-Early-stage. The architecture and MVP scope are drafted in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+This project is under active development. Here's what's implemented today.
 
-**Phase 1 (MCP Credential Offer Inspector) — done.** `inspect_credential_offer` resolves a Credential Offer by value or by reference (`credential_offer_uri`), validates it against OIDC4VCI 1.0, and returns the issuer, requested credential configuration IDs, and grants. See [src/mcp_oidc4vci/credential_offer.py](src/mcp_oidc4vci/credential_offer.py).
+**Credential Offer inspection.** `inspect_credential_offer` resolves a Credential Offer by value or by reference (`credential_offer_uri`), validates it against OIDC4VCI 1.0, and returns the issuer, requested credential configuration IDs, and grants. See [src/mcp_oidc4vci/credential_offer.py](src/mcp_oidc4vci/credential_offer.py).
 
-**Phase 2 (Metadata Discovery) — done.** `get_credential_issuer_metadata` fetches and validates a Credential Issuer's metadata from its well-known endpoint (correctly inserting the well-known path segment ahead of any path component in the issuer identifier, per spec), verifies the returned `credential_issuer` matches what was requested, and returns the credential endpoint, authorization servers, and supported credential configurations. See [src/mcp_oidc4vci/credential_issuer_metadata.py](src/mcp_oidc4vci/credential_issuer_metadata.py).
+**Credential Issuer metadata discovery.** `get_credential_issuer_metadata` fetches and validates a Credential Issuer's metadata from its well-known endpoint (correctly inserting the well-known path segment ahead of any path component in the issuer identifier, per spec), verifies the returned `credential_issuer` matches what was requested, and returns the credential endpoint, authorization servers, and supported credential configurations. See [src/mcp_oidc4vci/credential_issuer_metadata.py](src/mcp_oidc4vci/credential_issuer_metadata.py).
 
-**Phase 3 (Issuance Flow Engine) — done.** `describe_issuance_flow`, `initiate_issuance`, and `get_issuance_status` are implemented on top of an in-memory `IssuanceSessionStore`. For the pre-authorized code grant, `initiate_issuance` completes the real Token Request (OAuth Authorization Server discovery via RFC 8414, then the token exchange); for the authorization code grant it stops at `waiting_for_user_authorization`, since finishing that flow needs the wallet-driven redirect Phase 4 doesn't cover either (see below). See [src/mcp_oidc4vci/issuance.py](src/mcp_oidc4vci/issuance.py), [src/mcp_oidc4vci/authorization_server_metadata.py](src/mcp_oidc4vci/authorization_server_metadata.py), and [src/mcp_oidc4vci/token_request.py](src/mcp_oidc4vci/token_request.py).
+**Issuance flow orchestration.** `describe_issuance_flow`, `initiate_issuance`, and `get_issuance_status` run on top of an in-memory `IssuanceSessionStore`. For the pre-authorized code grant, `initiate_issuance` completes the full Token Request end to end — OAuth Authorization Server discovery via RFC 8414, then the token exchange, including a [DPoP](https://www.rfc-editor.org/rfc/rfc9449) proof of possession when the Authorization Server requires one. The authorization code grant is left at `waiting_for_user_authorization`, since completing it needs a wallet-driven browser redirect the Wallet Adapter doesn't cover yet. See [src/mcp_oidc4vci/issuance.py](src/mcp_oidc4vci/issuance.py), [src/mcp_oidc4vci/authorization_server_metadata.py](src/mcp_oidc4vci/authorization_server_metadata.py), [src/mcp_oidc4vci/token_request.py](src/mcp_oidc4vci/token_request.py), and [src/mcp_oidc4vci/dpop.py](src/mcp_oidc4vci/dpop.py).
 
-**Phase 4 (Wallet Boundary) — done (narrowed scope).** `WalletAdapter` (a `Protocol` with `generate_proof` and `receive_credential`) and `MockWalletAdapter` back the `request_credential` tool, which completes the Credential Request for a `ready_for_credential_request` session: fetch issuer metadata, get a fresh nonce if the issuer needs one, ask the wallet for a signed proof (a real EC-signed `openid4vci-proof+jwt`, never signed by this server), POST it, and hand the issued credential to the wallet — its contents never reach the agent. The pre-authorized code grant now works end to end. See [src/mcp_oidc4vci/wallet.py](src/mcp_oidc4vci/wallet.py), [src/mcp_oidc4vci/credential_request.py](src/mcp_oidc4vci/credential_request.py), and [src/mcp_oidc4vci/nonce.py](src/mcp_oidc4vci/nonce.py).
+**Wallet boundary.** `WalletAdapter` (a `Protocol` with `generate_proof` and `receive_credential`) backs `request_credential`, which completes the Credential Request for a `ready_for_credential_request` session: fetch issuer metadata, get a fresh nonce if the issuer needs one, ask the wallet for a signed proof (a real EC-signed `openid4vci-proof+jwt`, never signed by this server), send it — DPoP-bound if the session's access token is — and hand the issued credential to the wallet, whose contents never reach the agent. The bundled `MockWalletAdapter` makes the pre-authorized code grant work end to end for local testing. See [src/mcp_oidc4vci/wallet.py](src/mcp_oidc4vci/wallet.py), [src/mcp_oidc4vci/credential_request.py](src/mcp_oidc4vci/credential_request.py), and [src/mcp_oidc4vci/nonce.py](src/mcp_oidc4vci/nonce.py).
 
-**Phase 5 (Real Wallet Integration) — in progress.** Added `request_wallet_proof` / `submit_wallet_proof`, a manual two-tool-call path for when the proof must come from something other than the in-process `MockWalletAdapter` — a real wallet, or a human signing by hand — without needing any blocking-wait or webhook machinery: it hands off through the session the same way `initiate_issuance` → `get_issuance_status` already does. `request_credential` (the automatic path) is unchanged and still there for fast, fully-automated testing. See [Architecture](docs/ARCHITECTURE.md#request_wallet_proof-and-submit_wallet_proof) for why a blocking webhook-resolved wait — the more capable design, and a proven pattern reviewed from a sibling reference project — isn't what got built first: there's no real wallet counterpart yet to resolve it.
+**Manual wallet handoff.** `request_wallet_proof` / `submit_wallet_proof` split the Credential Request into two tool calls for when the proof must come from something other than the in-process `MockWalletAdapter` — a real wallet, or a human signing by hand — without needing any blocking-wait or webhook machinery: the handoff happens through the session, the same way `initiate_issuance` → `get_issuance_status` already does. `request_credential` (the automatic path) is unchanged and still there for fast, fully-automated testing. See [Architecture](docs/ARCHITECTURE.md#request_wallet_proof-and-submit_wallet_proof) for the design reasoning.
 
-Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 137 tests).
+Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 173 tests).
 
 ---
 
@@ -107,4 +107,3 @@ Pass its output straight to `submit_wallet_proof`'s `proof_jwt` argument.
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — components, design principles, wallet boundary, data flow, MCP tool contracts, security requirements.
-- [Roadmap](docs/ROADMAP.md) — MVP scope, development phases, non-goals, success criteria, future extensions.
