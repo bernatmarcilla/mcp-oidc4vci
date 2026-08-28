@@ -219,9 +219,9 @@ async def test_hands_each_issued_credential_to_the_wallet() -> None:
 
 
 async def test_rejects_the_pre_final_singular_credential_shape() -> None:
-    # This project targets v1.0 strictly (see docs/ARCHITECTURE.md). Some issuers (e.g.
-    # Namirial's dev gateway) still return this pre-final draft shape instead of the v1.0
-    # `credentials` array — it must be reported clearly as non-conformant, not accepted.
+    # This project targets v1.0 strictly (see docs/ARCHITECTURE.md). At least one real
+    # issuer's dev/test environment still returns this pre-final draft shape instead of the
+    # v1.0 `credentials` array — it must be reported clearly as non-conformant, not accepted.
     sessions = IssuanceSessionStore()
     session_id = await _ready_session(sessions)
     wallet = MockWalletAdapter()
