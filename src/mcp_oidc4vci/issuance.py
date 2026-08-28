@@ -15,8 +15,10 @@ from mcp_oidc4vci.authorization_server_metadata import (
     get_authorization_server_metadata,
 )
 from mcp_oidc4vci.credential_offer import CredentialOfferFetcher, resolve_credential_offer
+from mcp_oidc4vci.dpop import SUPPORTED_DPOP_SIGNING_ALG, DPoPKey
 from mcp_oidc4vci.models import (
     PRE_AUTHORIZED_CODE_GRANT_TYPE,
+    AuthorizationServerMetadata,
     CredentialOffer,
     IssuanceFlowDescription,
     IssuanceFlowStep,
@@ -116,7 +118,10 @@ class IssuanceSession:
     `access_token` is intentionally never surfaced by `get_issuance_status` — it stays
     server-side per the "MCP exposes capabilities, not raw secrets" design principle.
     `proof_nonce` only has a value while `status == "awaiting_wallet_proof"` — the manual
-    proof handoff between `request_wallet_proof` and `submit_wallet_proof`.
+    proof handoff between `request_wallet_proof` and `submit_wallet_proof`. `dpop_key` and
+    `dpop_bound` carry the RFC 9449 DPoP key generated for this session (when the
+    Authorization Server advertises support) and whether the resulting access token ended
+    up DPoP-bound, so a later `request_credential` call can present it the same way.
     """
 
     session_id: str
@@ -127,6 +132,8 @@ class IssuanceSession:
     error: str | None = None
     access_token: str | None = None
     proof_nonce: str | None = None
+    dpop_key: DPoPKey | None = None
+    dpop_bound: bool = False
 
 
 class IssuanceSessionStore:
@@ -162,6 +169,8 @@ class IssuanceSessionStore:
         error: str | None = None,
         access_token: str | None = None,
         proof_nonce: str | None = None,
+        dpop_key: DPoPKey | None = None,
+        dpop_bound: bool | None = None,
     ) -> IssuanceSession:
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -172,6 +181,10 @@ class IssuanceSessionStore:
             session.proof_nonce = proof_nonce
             if access_token is not None:
                 session.access_token = access_token
+            if dpop_key is not None:
+                session.dpop_key = dpop_key
+            if dpop_bound is not None:
+                session.dpop_bound = dpop_bound
             return session
 
     async def get(self, session_id: str) -> IssuanceSession:
@@ -248,10 +261,12 @@ async def _complete_pre_authorized_code_flow(
         as_metadata = await get_authorization_server_metadata(
             authorization_server, fetch=fetch_as_metadata
         )
+        dpop_key = DPoPKey() if _dpop_signing_alg_supported(as_metadata) else None
         token = await request_token_with_pre_authorized_code(
             as_metadata.token_endpoint,
             grant.pre_authorized_code,
             tx_code=tx_code,
+            dpop_key=dpop_key,
             post=post_token_request,
         )
     except (
@@ -262,5 +277,16 @@ async def _complete_pre_authorized_code_flow(
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
     return await sessions.update(
-        session.session_id, status="ready_for_credential_request", access_token=token.access_token
+        session.session_id,
+        status="ready_for_credential_request",
+        access_token=token.access_token,
+        dpop_key=dpop_key,
+        dpop_bound=(token.token_type == "DPoP"),
     )
+
+
+def _dpop_signing_alg_supported(as_metadata: AuthorizationServerMetadata) -> bool:
+    # RFC 9449 §5.1: presence of this field, with an algorithm we can sign with, is the
+    # spec-defined signal to proactively attach a DPoP proof rather than wait for a rejection.
+    algs = as_metadata.dpop_signing_alg_values_supported
+    return algs is not None and SUPPORTED_DPOP_SIGNING_ALG in algs

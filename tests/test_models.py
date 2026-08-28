@@ -124,6 +124,26 @@ def test_authorization_server_metadata_requires_issuer_and_token_endpoint() -> N
         AuthorizationServerMetadata.model_validate({"issuer": "https://as.example.com"})
 
 
+def test_authorization_server_metadata_dpop_signing_algs_default_to_absent() -> None:
+    metadata = AuthorizationServerMetadata.model_validate(
+        {"issuer": "https://as.example.com", "token_endpoint": "https://as.example.com/token"}
+    )
+
+    assert metadata.dpop_signing_alg_values_supported is None
+
+
+def test_authorization_server_metadata_parses_dpop_signing_algs() -> None:
+    metadata = AuthorizationServerMetadata.model_validate(
+        {
+            "issuer": "https://as.example.com",
+            "token_endpoint": "https://as.example.com/token",
+            "dpop_signing_alg_values_supported": ["ES256"],
+        }
+    )
+
+    assert metadata.dpop_signing_alg_values_supported == ["ES256"]
+
+
 def test_token_success_response_requires_access_token_and_token_type() -> None:
     with pytest.raises(ValidationError):
         TokenSuccessResponse.model_validate({"access_token": "abc"})

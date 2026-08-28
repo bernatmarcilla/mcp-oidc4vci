@@ -41,7 +41,9 @@ async def _fail_if_fetched(url: str) -> str:
     raise AssertionError(f"unexpected metadata fetch for {url!r}")
 
 
-async def _fail_if_posted(url: str, data: dict[str, str]) -> tuple[int, str]:
+async def _fail_if_posted(
+    url: str, data: dict[str, str], headers: dict[str, str]
+) -> tuple[int, dict[str, str], str]:
     raise AssertionError(f"unexpected token request to {url!r}")
 
 
@@ -227,9 +229,11 @@ async def test_initiate_issuance_completes_the_token_exchange_on_success() -> No
         requested_as_issuer.append(url)
         return '{"issuer": "https://issuer.example.com", "token_endpoint": "https://issuer.example.com/token"}'
 
-    async def fake_post(url: str, data: dict[str, str]) -> tuple[int, str]:
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
         assert url == "https://issuer.example.com/token"
-        return 200, '{"access_token": "secret-token", "token_type": "Bearer"}'
+        return 200, {}, '{"access_token": "secret-token", "token_type": "Bearer"}'
 
     session = await initiate_issuance(
         _offer_uri(_pre_authorized_offer_json()),
@@ -243,6 +247,9 @@ async def test_initiate_issuance_completes_the_token_exchange_on_success() -> No
     assert requested_as_issuer == [
         "https://issuer.example.com/.well-known/oauth-authorization-server"
     ]
+    # AS metadata here doesn't advertise DPoP support, so no key should be generated.
+    assert session.dpop_key is None
+    assert session.dpop_bound is False
 
 
 async def test_initiate_issuance_uses_the_grants_authorization_server_hint_when_present() -> None:
@@ -254,8 +261,10 @@ async def test_initiate_issuance_uses_the_grants_authorization_server_hint_when_
             '{"issuer": "https://as.example.com", "token_endpoint": "https://as.example.com/token"}'
         )
 
-    async def fake_post(url: str, data: dict[str, str]) -> tuple[int, str]:
-        return 200, '{"access_token": "secret-token", "token_type": "Bearer"}'
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 200, {}, '{"access_token": "secret-token", "token_type": "Bearer"}'
 
     await initiate_issuance(
         _offer_uri(_pre_authorized_offer_json(authorization_server="https://as.example.com")),
@@ -273,9 +282,11 @@ async def test_initiate_issuance_sends_the_provided_tx_code() -> None:
     async def fake_as_metadata(url: str) -> str:
         return '{"issuer": "https://issuer.example.com", "token_endpoint": "https://issuer.example.com/token"}'
 
-    async def fake_post(url: str, data: dict[str, str]) -> tuple[int, str]:
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
         captured.update(data)
-        return 200, '{"access_token": "secret-token", "token_type": "Bearer"}'
+        return 200, {}, '{"access_token": "secret-token", "token_type": "Bearer"}'
 
     await initiate_issuance(
         _offer_uri(_pre_authorized_offer_json(tx_code=True)),
@@ -320,8 +331,10 @@ async def test_initiate_issuance_fails_the_session_when_the_token_request_is_rej
     async def fake_as_metadata(url: str) -> str:
         return '{"issuer": "https://issuer.example.com", "token_endpoint": "https://issuer.example.com/token"}'
 
-    async def rejecting_post(url: str, data: dict[str, str]) -> tuple[int, str]:
-        return 400, '{"error": "invalid_grant", "error_description": "code expired"}'
+    async def rejecting_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 400, {}, '{"error": "invalid_grant", "error_description": "code expired"}'
 
     session = await initiate_issuance(
         _offer_uri(_pre_authorized_offer_json()),
@@ -332,6 +345,89 @@ async def test_initiate_issuance_fails_the_session_when_the_token_request_is_rej
 
     assert session.status == "failed"
     assert session.error == "code expired"
+
+
+# -- initiate_issuance: DPoP (RFC 9449) ---------------------------------------
+
+
+async def test_initiate_issuance_attaches_dpop_and_marks_session_bound() -> None:
+    captured_headers: list[dict[str, str]] = []
+
+    async def fake_as_metadata(url: str) -> str:
+        return (
+            '{"issuer": "https://issuer.example.com", '
+            '"token_endpoint": "https://issuer.example.com/token", '
+            '"dpop_signing_alg_values_supported": ["ES256"]}'
+        )
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_headers.append(headers)
+        return 200, {}, '{"access_token": "secret-token", "token_type": "DPoP"}'
+
+    session = await initiate_issuance(
+        _offer_uri(_pre_authorized_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=fake_as_metadata,
+        post_token_request=fake_post,
+    )
+
+    assert session.status == "ready_for_credential_request"
+    assert session.dpop_bound is True
+    assert session.dpop_key is not None
+    assert "DPoP" in captured_headers[0]
+
+
+async def test_initiate_issuance_keeps_session_unbound_when_as_returns_bearer() -> None:
+    async def fake_as_metadata(url: str) -> str:
+        return (
+            '{"issuer": "https://issuer.example.com", '
+            '"token_endpoint": "https://issuer.example.com/token", '
+            '"dpop_signing_alg_values_supported": ["ES256"]}'
+        )
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        # The AS advertised DPoP, so a proof is still offered, but it chose not to bind.
+        return 200, {}, '{"access_token": "secret-token", "token_type": "Bearer"}'
+
+    session = await initiate_issuance(
+        _offer_uri(_pre_authorized_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=fake_as_metadata,
+        post_token_request=fake_post,
+    )
+
+    assert session.dpop_bound is False
+
+
+async def test_initiate_issuance_skips_dpop_when_as_only_advertises_an_unsupported_alg() -> None:
+    captured_headers: list[dict[str, str]] = []
+
+    async def fake_as_metadata(url: str) -> str:
+        return (
+            '{"issuer": "https://issuer.example.com", '
+            '"token_endpoint": "https://issuer.example.com/token", '
+            '"dpop_signing_alg_values_supported": ["RS256"]}'
+        )
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_headers.append(headers)
+        return 200, {}, '{"access_token": "secret-token", "token_type": "Bearer"}'
+
+    session = await initiate_issuance(
+        _offer_uri(_pre_authorized_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=fake_as_metadata,
+        post_token_request=fake_post,
+    )
+
+    assert session.dpop_key is None
+    assert "DPoP" not in captured_headers[0]
 
 
 # -- initiate_issuance: upfront failures create no session --------------------

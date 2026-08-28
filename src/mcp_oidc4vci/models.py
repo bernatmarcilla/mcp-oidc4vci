@@ -97,6 +97,9 @@ class AuthorizationServerMetadata(BaseModel):
 
     issuer: str
     token_endpoint: str
+    # RFC 9449 §5.1. Presence signals DPoP support; used to decide whether to proactively
+    # attach a DPoP proof to the Token Request.
+    dpop_signing_alg_values_supported: list[str] | None = None
 
 
 class TokenSuccessResponse(BaseModel):

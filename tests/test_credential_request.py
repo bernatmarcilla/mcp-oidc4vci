@@ -1,4 +1,5 @@
 import httpx
+import jwt
 import pytest
 
 from mcp_oidc4vci import credential_request
@@ -9,6 +10,7 @@ from mcp_oidc4vci.credential_request import (
     request_wallet_proof,
     submit_wallet_proof,
 )
+from mcp_oidc4vci.dpop import DPoPKey
 from mcp_oidc4vci.issuance import (
     AUTHORIZATION_CODE_FLOW,
     IssuanceSessionNotFoundError,
@@ -19,6 +21,7 @@ from mcp_oidc4vci.wallet import MockWalletAdapter
 from support import mock_async_client
 
 ISSUER = "https://issuer.example.com"
+_SUCCESS_BODY = '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
 
 
 def _issuer_metadata_json(*, nonce_endpoint: str | None = None) -> str:
@@ -40,13 +43,22 @@ async def _fail_if_nonce_posted(url: str) -> tuple[int, str]:
 
 
 async def _fail_if_credential_posted(
-    url: str, body: dict[str, object], access_token: str
-) -> tuple[int, str]:
+    url: str, body: dict[str, object], headers: dict[str, str]
+) -> tuple[int, dict[str, str], str]:
     raise AssertionError(f"unexpected credential request to {url!r}")
 
 
+async def _success_post(
+    url: str, body: dict[str, object], headers: dict[str, str]
+) -> tuple[int, dict[str, str], str]:
+    return 200, {}, _SUCCESS_BODY
+
+
 async def _ready_session(
-    sessions: IssuanceSessionStore, *, access_token: str = "secret-token"
+    sessions: IssuanceSessionStore,
+    *,
+    access_token: str = "secret-token",
+    dpop_bound: bool = False,
 ) -> str:
     session = await sessions.create(
         credential_issuer=ISSUER,
@@ -54,7 +66,11 @@ async def _ready_session(
         flow_type=PRE_AUTHORIZED_CODE_GRANT_TYPE,
     )
     await sessions.update(
-        session.session_id, status="ready_for_credential_request", access_token=access_token
+        session.session_id,
+        status="ready_for_credential_request",
+        access_token=access_token,
+        dpop_key=DPoPKey() if dpop_bound else None,
+        dpop_bound=dpop_bound,
     )
     return session.session_id
 
@@ -102,7 +118,7 @@ async def test_completes_without_a_nonce_when_the_issuer_has_no_nonce_endpoint()
     sessions = IssuanceSessionStore()
     session_id = await _ready_session(sessions)
     captured_proof_calls: list[dict[str, object]] = []
-    captured_requests: list[tuple[str, dict[str, object], str]] = []
+    captured_requests: list[tuple[str, dict[str, object], dict[str, str]]] = []
 
     async def fake_issuer_metadata(url: str) -> str:
         return _issuer_metadata_json()
@@ -112,9 +128,11 @@ async def test_completes_without_a_nonce_when_the_issuer_has_no_nonce_endpoint()
             captured_proof_calls.append({"audience": audience, "nonce": nonce})
             return await super().generate_proof(audience=audience, nonce=nonce)
 
-    async def fake_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
-        captured_requests.append((url, body, access_token))
-        return 200, '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_requests.append((url, body, headers))
+        return 200, {}, _SUCCESS_BODY
 
     session = await request_credential(
         session_id,
@@ -128,9 +146,9 @@ async def test_completes_without_a_nonce_when_the_issuer_has_no_nonce_endpoint()
     assert session.status == "completed"
     assert captured_proof_calls == [{"audience": ISSUER, "nonce": None}]
     assert len(captured_requests) == 1
-    url, body, access_token = captured_requests[0]
+    url, body, headers = captured_requests[0]
     assert url == f"{ISSUER}/credential"
-    assert access_token == "secret-token"
+    assert headers["Authorization"] == "Bearer secret-token"
     assert body["credential_configuration_id"] == "UniversityDegreeCredential"
     proofs = body["proofs"]
     assert isinstance(proofs, dict)
@@ -156,16 +174,13 @@ async def test_requests_a_nonce_and_binds_it_into_the_proof_when_available() -> 
             captured_proof_calls.append({"audience": audience, "nonce": nonce})
             return await super().generate_proof(audience=audience, nonce=nonce)
 
-    async def fake_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
-        return 200, '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
-
     await request_credential(
         session_id,
         sessions=sessions,
         wallet=RecordingWallet(),
         fetch_issuer_metadata=fake_issuer_metadata,
         fetch_nonce=fake_nonce,
-        post_credential_request=fake_post,
+        post_credential_request=_success_post,
     )
 
     assert requested_nonce_urls == [f"{ISSUER}/nonce"]
@@ -177,9 +192,13 @@ async def test_hands_each_issued_credential_to_the_wallet() -> None:
     session_id = await _ready_session(sessions)
     wallet = MockWalletAdapter()
 
-    async def fake_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
-        return 200, (
-            '{"credentials": [{"credential": "vc-one"}, {"credential": {"nested": "vc-two"}}]}'
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return (
+            200,
+            {},
+            '{"credentials": [{"credential": "vc-one"}, {"credential": {"nested": "vc-two"}}]}',
         )
 
     await request_credential(
@@ -250,9 +269,9 @@ async def test_fails_the_session_when_the_credential_request_is_rejected() -> No
     session_id = await _ready_session(sessions)
 
     async def rejecting_post(
-        url: str, body: dict[str, object], access_token: str
-    ) -> tuple[int, str]:
-        return 400, '{"error": "invalid_proof", "error_description": "proof nonce expired"}'
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 400, {}, '{"error": "invalid_proof", "error_description": "proof nonce expired"}'
 
     session = await request_credential(
         session_id,
@@ -272,9 +291,9 @@ async def test_fails_the_session_for_a_deferred_response_without_calling_the_wal
     wallet = MockWalletAdapter()
 
     async def deferred_post(
-        url: str, body: dict[str, object], access_token: str
-    ) -> tuple[int, str]:
-        return 202, '{"transaction_id": "8xLOxBtZp8", "interval": 5}'
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 202, {}, '{"transaction_id": "8xLOxBtZp8", "interval": 5}'
 
     session = await request_credential(
         session_id,
@@ -294,8 +313,10 @@ async def test_fails_the_session_for_a_success_response_with_neither_field_prese
     sessions = IssuanceSessionStore()
     session_id = await _ready_session(sessions)
 
-    async def empty_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
-        return 200, "{}"
+    async def empty_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 200, {}, "{}"
 
     session = await request_credential(
         session_id,
@@ -314,9 +335,9 @@ async def test_fails_the_session_when_the_response_body_is_not_valid_json() -> N
     session_id = await _ready_session(sessions)
 
     async def not_json_post(
-        url: str, body: dict[str, object], access_token: str
-    ) -> tuple[int, str]:
-        return 200, "not-json"
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 200, {}, "not-json"
 
     session = await request_credential(
         session_id,
@@ -335,9 +356,9 @@ async def test_fails_the_session_for_a_malformed_success_response() -> None:
     session_id = await _ready_session(sessions)
 
     async def malformed_post(
-        url: str, body: dict[str, object], access_token: str
-    ) -> tuple[int, str]:
-        return 200, '{"credentials": "not-a-list"}'
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 200, {}, '{"credentials": "not-a-list"}'
 
     session = await request_credential(
         session_id,
@@ -356,9 +377,9 @@ async def test_fails_the_session_for_a_malformed_error_response() -> None:
     session_id = await _ready_session(sessions)
 
     async def malformed_error_post(
-        url: str, body: dict[str, object], access_token: str
-    ) -> tuple[int, str]:
-        return 400, '{"unexpected": "shape"}'
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 400, {}, '{"unexpected": "shape"}'
 
     session = await request_credential(
         session_id,
@@ -372,6 +393,28 @@ async def test_fails_the_session_for_a_malformed_error_response() -> None:
     assert session.error is not None
 
 
+async def test_fails_the_session_when_the_transport_fails() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+
+    async def broken_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        raise ConnectionError("boom")
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=broken_post,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+    assert "boom" in session.error
+
+
 async def test_default_poster_sends_a_bearer_token_and_json_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -383,10 +426,10 @@ async def test_default_poster_sends_a_bearer_token_and_json_body(
 
     monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
 
-    status_code, body = await credential_request._post_credential_request(
+    status_code, _headers, body = await credential_request._post_credential_request(
         f"{ISSUER}/credential",
         {"credential_configuration_id": "UniversityDegreeCredential", "proofs": {"jwt": ["x"]}},
-        "secret-token",
+        {"Authorization": "Bearer secret-token"},
     )
 
     assert status_code == 200
@@ -404,6 +447,118 @@ async def test_raises_credential_request_rejected_error_directly_for_a_well_form
     assert exc.error == "invalid_proof"
     assert exc.error_description == "proof nonce expired"
     assert str(exc) == "proof nonce expired"
+
+
+# -- DPoP (RFC 9449): the access token is DPoP-bound ---------------------------
+
+
+async def test_uses_the_dpop_scheme_and_attaches_a_proof_with_ath_when_dpop_bound() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions, dpop_bound=True)
+    captured_requests: list[tuple[str, dict[str, str]]] = []
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_requests.append((url, headers))
+        return 200, {}, _SUCCESS_BODY
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert session.status == "completed"
+    assert len(captured_requests) == 1
+    url, headers = captured_requests[0]
+    assert headers["Authorization"] == "DPoP secret-token"
+    proof_claims = jwt.decode(headers["DPoP"], options={"verify_signature": False})
+    assert proof_claims["htm"] == "POST"
+    assert proof_claims["htu"] == url
+    assert "ath" in proof_claims
+
+
+async def test_retries_once_with_the_servers_nonce_after_a_resource_server_challenge() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions, dpop_bound=True)
+    seen_nonces: list[str | None] = []
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        claims = jwt.decode(headers["DPoP"], options={"verify_signature": False})
+        seen_nonces.append(claims.get("nonce"))
+        if len(seen_nonces) == 1:
+            return (
+                401,
+                {"www-authenticate": 'DPoP error="use_dpop_nonce"', "dpop-nonce": "rs-nonce"},
+                "",
+            )
+        return 200, {}, _SUCCESS_BODY
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert session.status == "completed"
+    assert seen_nonces == [None, "rs-nonce"]
+
+
+async def test_fails_the_session_if_the_resource_server_keeps_demanding_a_new_nonce() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions, dpop_bound=True)
+
+    async def always_challenges(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return (
+            401,
+            {"www-authenticate": 'DPoP error="use_dpop_nonce"', "dpop-nonce": "rs-nonce"},
+            "",
+        )
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=always_challenges,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+
+
+async def test_does_not_treat_a_plain_401_as_a_nonce_challenge() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions, dpop_bound=True)
+    call_count = 0
+
+    async def unauthorized_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        nonlocal call_count
+        call_count += 1
+        return 401, {}, '{"error": "invalid_token", "error_description": "token expired"}'
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=unauthorized_post,
+    )
+
+    assert call_count == 1
+    assert session.status == "failed"
+    assert session.error == "token expired"
 
 
 # -- request_wallet_proof / submit_wallet_proof: the manual two-step path -----
@@ -495,15 +650,17 @@ async def test_submit_wallet_proof_completes_the_request_without_asking_the_wall
 ):
     sessions = IssuanceSessionStore()
     session_id = await _awaiting_proof_session(sessions)
-    captured_requests: list[tuple[str, dict[str, object], str]] = []
+    captured_requests: list[tuple[str, dict[str, object], dict[str, str]]] = []
 
     class RefusesToSignWallet(MockWalletAdapter):
         async def generate_proof(self, *, audience: str, nonce: str | None) -> str:
             raise AssertionError("submit_wallet_proof must not ask the wallet to sign")
 
-    async def fake_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
-        captured_requests.append((url, body, access_token))
-        return 200, '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_requests.append((url, body, headers))
+        return 200, {}, _SUCCESS_BODY
 
     session = await submit_wallet_proof(
         session_id,
@@ -517,7 +674,7 @@ async def test_submit_wallet_proof_completes_the_request_without_asking_the_wall
     assert session.status == "completed"
     assert session.proof_nonce is None
     assert len(captured_requests) == 1
-    _url, body, _token = captured_requests[0]
+    _url, body, _headers = captured_requests[0]
     assert body["proofs"] == {"jwt": ["externally-signed-jwt"]}
 
 
@@ -526,16 +683,13 @@ async def test_submit_wallet_proof_hands_the_credential_to_the_wallet() -> None:
     session_id = await _awaiting_proof_session(sessions)
     wallet = MockWalletAdapter()
 
-    async def fake_post(url: str, body: dict[str, object], access_token: str) -> tuple[int, str]:
-        return 200, '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
-
     await submit_wallet_proof(
         session_id,
         "externally-signed-jwt",
         sessions=sessions,
         wallet=wallet,
         fetch_issuer_metadata=_fetch_default_issuer_metadata,
-        post_credential_request=fake_post,
+        post_credential_request=_success_post,
     )
 
     assert wallet.received_credentials == [
@@ -570,9 +724,13 @@ async def test_submit_wallet_proof_fails_the_session_when_the_request_is_rejecte
     session_id = await _awaiting_proof_session(sessions)
 
     async def rejecting_post(
-        url: str, body: dict[str, object], access_token: str
-    ) -> tuple[int, str]:
-        return 400, '{"error": "invalid_proof", "error_description": "signature did not verify"}'
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return (
+            400,
+            {},
+            '{"error": "invalid_proof", "error_description": "signature did not verify"}',
+        )
 
     session = await submit_wallet_proof(
         session_id,

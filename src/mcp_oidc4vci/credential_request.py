@@ -24,9 +24,14 @@ from mcp_oidc4vci.models import (
 from mcp_oidc4vci.nonce import InvalidNonceResponseError, NoncePoster, request_nonce
 from mcp_oidc4vci.wallet import WalletAdapter
 
-CredentialRequester = Callable[[str, dict[str, object], str], Awaitable[tuple[int, str]]]
+# (url, json_body, headers) -> (status_code, response_headers, body). Response header keys
+# are lowercased, matching HTTP's case-insensitive header names.
+CredentialRequester = Callable[
+    [str, dict[str, object], dict[str, str]], Awaitable[tuple[int, dict[str, str], str]]
+]
 
 _HTTP_TIMEOUT_SECONDS = 10.0
+_DPOP_NONCE_ERROR = 'error="use_dpop_nonce"'
 
 
 class CredentialRequestError(Exception):
@@ -193,17 +198,16 @@ async def _send_credential_request(
 ) -> IssuanceSession:
     assert session.access_token is not None
     credential_configuration_id = session.credential_configuration_ids[0]
+    body: dict[str, object] = {
+        "credential_configuration_id": credential_configuration_id,
+        "proofs": {"jwt": [proof]},
+    }
 
     try:
-        status_code, body = await (post_credential_request or _post_credential_request)(
-            credential_endpoint,
-            {
-                "credential_configuration_id": credential_configuration_id,
-                "proofs": {"jwt": [proof]},
-            },
-            session.access_token,
+        status_code, response_body = await _post_with_dpop(
+            post_credential_request or _post_credential_request, credential_endpoint, body, session
         )
-        response = _parse_credential_response(status_code, body)
+        response = _parse_credential_response(status_code, response_body)
     except (CredentialRequestRejectedError, InvalidCredentialResponseError) as exc:
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
@@ -255,11 +259,61 @@ def _parse_credential_response(status_code: int, body: str) -> CredentialRespons
     raise CredentialRequestRejectedError(error.error, error.error_description)
 
 
-async def _post_credential_request(
-    url: str, body: dict[str, object], access_token: str
+async def _post_with_dpop(
+    poster: CredentialRequester,
+    url: str,
+    body: dict[str, object],
+    session: IssuanceSession,
 ) -> tuple[int, str]:
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            url, json=body, headers={"Authorization": f"Bearer {access_token}"}
+    """POST the Credential Request, attaching Authorization (Bearer or DPoP, per whether the
+    session's access token ended up DPoP-bound — RFC 9449 §7.1) and, for a DPoP-bound token,
+    a DPoP proof over this request. Retries once with a server-supplied nonce if the
+    credential endpoint demands one (§9).
+    """
+    assert session.access_token is not None
+    scheme = "DPoP" if session.dpop_bound else "Bearer"
+    dpop_nonce: str | None = None
+
+    for attempt in range(2):
+        headers = {"Authorization": f"{scheme} {session.access_token}"}
+        if session.dpop_bound:
+            assert session.dpop_key is not None
+            headers["DPoP"] = session.dpop_key.create_proof(
+                http_method="POST",
+                http_uri=url,
+                nonce=dpop_nonce,
+                access_token=session.access_token,
+            )
+
+        try:
+            status_code, response_headers, response_body = await poster(url, body, headers)
+        except Exception as exc:
+            raise InvalidCredentialResponseError(
+                f"Failed to reach credential endpoint {url!r}: {exc}"
+            ) from exc
+
+        needs_retry = (
+            status_code == 401
+            and session.dpop_bound
+            and attempt == 0
+            and _DPOP_NONCE_ERROR in (response_headers.get("www-authenticate") or "")
         )
-        return response.status_code, response.text
+        new_nonce = response_headers.get("dpop-nonce")
+        if needs_retry and new_nonce:
+            dpop_nonce = new_nonce
+            continue
+        return status_code, response_body
+
+    raise InvalidCredentialResponseError("Credential endpoint kept demanding a new DPoP nonce.")
+
+
+async def _post_credential_request(
+    url: str, body: dict[str, object], headers: dict[str, str]
+) -> tuple[int, dict[str, str], str]:
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
+        response = await client.post(url, json=body, headers=headers)
+        return (
+            response.status_code,
+            {k.lower(): v for k, v in response.headers.items()},
+            response.text,
+        )
