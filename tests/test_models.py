@@ -98,6 +98,24 @@ def test_credential_configuration_parses_its_nested_display_name() -> None:
     assert config.credential_metadata.display[0].name == "University Degree"
 
 
+def test_credential_configuration_accepts_cose_integer_signing_algs() -> None:
+    # mso_mdoc (COSE-based) identifies algorithms by IANA COSE Algorithms registry integers
+    # (e.g. -7 for ES256) rather than the JOSE string identifiers other formats use.
+    config = CredentialConfiguration.model_validate(
+        {"format": "mso_mdoc", "credential_signing_alg_values_supported": [-7]}
+    )
+
+    assert config.credential_signing_alg_values_supported == [-7]
+
+
+def test_credential_configuration_accepts_jose_string_signing_algs() -> None:
+    config = CredentialConfiguration.model_validate(
+        {"format": "vc+sd-jwt", "credential_signing_alg_values_supported": ["ES256"]}
+    )
+
+    assert config.credential_signing_alg_values_supported == ["ES256"]
+
+
 def test_credential_issuer_metadata_requires_credential_endpoint_and_configurations() -> None:
     with pytest.raises(ValidationError):
         CredentialIssuerMetadata.model_validate({"credential_issuer": "https://issuer.example.com"})
