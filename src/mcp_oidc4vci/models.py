@@ -77,7 +77,10 @@ class CredentialConfiguration(BaseModel):
     format: str
     scope: str | None = None
     cryptographic_binding_methods_supported: list[str] | None = None
-    credential_signing_alg_values_supported: list[str] | None = None
+    # The spec leaves each identifier's type to the credential format: JOSE-based formats use
+    # a string alg (e.g. "ES256"), COSE-based formats like mso_mdoc use an integer from the
+    # IANA COSE Algorithms registry (e.g. -7, also ES256).
+    credential_signing_alg_values_supported: list[str | int] | None = None
     credential_metadata: CredentialMetadata | None = None
 
 

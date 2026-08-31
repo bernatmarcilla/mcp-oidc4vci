@@ -100,6 +100,9 @@ async def _fetch_metadata(url: str, fetch: MetadataFetcher) -> str:
 
 async def _fetch_metadata_url(url: str) -> str:
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.get(url)
+        # Some issuers default to a signed-JWT metadata representation (Content-Type
+        # application/jwt) unless a client explicitly asks for JSON — this server has no use
+        # for the signature, only the claims, so it always asks for the plain form.
+        response = await client.get(url, headers={"Accept": "application/json"})
         response.raise_for_status()
         return response.text
