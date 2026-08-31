@@ -46,6 +46,32 @@ Full details, component responsibilities, data flows, tool contracts, and securi
 
 ---
 
+## Feature support
+
+| Feature | Status |
+| --- | --- |
+| Credential Offer, by value or by reference | Supported |
+| Pre-Authorized Code Grant | Supported |
+| Authorization Code Grant | Supported |
+| PKCE ([RFC 7636](https://www.rfc-editor.org/rfc/rfc7636), `S256`) | Supported |
+| Pushed Authorization Requests ([RFC 9126](https://www.rfc-editor.org/rfc/rfc9126)) | Supported, auto-detected from Authorization Server metadata |
+| DPoP ([RFC 9449](https://www.rfc-editor.org/rfc/rfc9449)) | Supported, auto-detected from Authorization Server metadata |
+| Rich Authorization Requests / `authorization_details` ([RFC 9396](https://www.rfc-editor.org/rfc/rfc9396)) | Supported, replaced by a `scope` fallback when one is available, for Authorization Servers that don't support RAR |
+| Transaction Code (`tx_code`) | Supported |
+| Nonce Endpoint / `c_nonce` | Supported |
+| `jwt` Proof Type | Supported |
+| `attestation` Proof Type / key attestation | Not yet |
+| Deferred Credential Issuance | Not yet — treated as a failure rather than polled |
+| Multiple credential configurations per offer | Not yet — only the first requested one is used |
+| Signed (JWT) Credential Issuer Metadata | Not verified — plain JSON is requested and used instead |
+| Credential Request/Response Encryption | Not yet |
+| Batch Credential Issuance | Not yet |
+| Notification Endpoint | Not yet — `notification_id` is parsed but not acted on |
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design reasoning behind each of these.
+
+---
+
 ## Current capabilities
 
 This project is under active development. Here's what's implemented today.
@@ -54,13 +80,15 @@ This project is under active development. Here's what's implemented today.
 
 **Credential Issuer metadata discovery.** `get_credential_issuer_metadata` fetches and validates a Credential Issuer's metadata from its well-known endpoint (correctly inserting the well-known path segment ahead of any path component in the issuer identifier, per spec), verifies the returned `credential_issuer` matches what was requested, and returns the credential endpoint, authorization servers, and supported credential configurations. See [src/mcp_oidc4vci/credential_issuer_metadata.py](src/mcp_oidc4vci/credential_issuer_metadata.py).
 
-**Issuance flow orchestration.** `describe_issuance_flow`, `initiate_issuance`, and `get_issuance_status` run on top of an in-memory `IssuanceSessionStore`. For the pre-authorized code grant, `initiate_issuance` completes the full Token Request end to end — OAuth Authorization Server discovery via RFC 8414, then the token exchange, including a [DPoP](https://www.rfc-editor.org/rfc/rfc9449) proof of possession when the Authorization Server requires one. The authorization code grant is left at `waiting_for_user_authorization`, since completing it needs a wallet-driven browser redirect the Wallet Adapter doesn't cover yet. See [src/mcp_oidc4vci/issuance.py](src/mcp_oidc4vci/issuance.py), [src/mcp_oidc4vci/authorization_server_metadata.py](src/mcp_oidc4vci/authorization_server_metadata.py), [src/mcp_oidc4vci/token_request.py](src/mcp_oidc4vci/token_request.py), and [src/mcp_oidc4vci/dpop.py](src/mcp_oidc4vci/dpop.py).
+**Issuance flow orchestration.** `describe_issuance_flow`, `initiate_issuance`, and `get_issuance_status` run on top of an in-memory `IssuanceSessionStore`. For the pre-authorized code grant, `initiate_issuance` completes the full Token Request end to end — OAuth Authorization Server discovery via RFC 8414, then the token exchange, including a [DPoP](https://www.rfc-editor.org/rfc/rfc9449) proof of possession when the Authorization Server requires one. For the authorization code grant, it resolves the Authorization Server's metadata and leaves the session ready for `begin_authorization`. See [src/mcp_oidc4vci/issuance.py](src/mcp_oidc4vci/issuance.py), [src/mcp_oidc4vci/authorization_server_metadata.py](src/mcp_oidc4vci/authorization_server_metadata.py), [src/mcp_oidc4vci/token_request.py](src/mcp_oidc4vci/token_request.py), and [src/mcp_oidc4vci/dpop.py](src/mcp_oidc4vci/dpop.py).
 
-**Wallet boundary.** `WalletAdapter` (a `Protocol` with `generate_proof` and `receive_credential`) backs `request_credential`, which completes the Credential Request for a `ready_for_credential_request` session: fetch issuer metadata, get a fresh nonce if the issuer needs one, ask the wallet for a signed proof (a real EC-signed `openid4vci-proof+jwt`, never signed by this server), send it — DPoP-bound if the session's access token is — and hand the issued credential to the wallet, whose contents never reach the agent. The bundled `MockWalletAdapter` makes the pre-authorized code grant work end to end for local testing. See [src/mcp_oidc4vci/wallet.py](src/mcp_oidc4vci/wallet.py), [src/mcp_oidc4vci/credential_request.py](src/mcp_oidc4vci/credential_request.py), and [src/mcp_oidc4vci/nonce.py](src/mcp_oidc4vci/nonce.py).
+**Authorization code grant.** `begin_authorization` builds the Authorization Request URL (PKCE, RFC 7636, `S256`; `authorization_details` naming the requested credential configurations, RFC 9396 — replaced by each configuration's own `scope`, when one is available, for an Authorization Server that doesn't support Rich Authorization Requests) for a human to open and complete — pushing its parameters first via [Pushed Authorization Requests](https://www.rfc-editor.org/rfc/rfc9126) when the Authorization Server requires it, transparently to the caller — and `submit_authorization_result` exchanges the resulting `code`/`state` for an access token, rejecting a mismatched `state` before ever making a Token Request. This server has no HTTP endpoint of its own to receive the browser redirect, so the `code`/`state` are supplied back explicitly rather than captured automatically — see [Architecture](docs/ARCHITECTURE.md#begin_authorization-and-submit_authorization_result) for why. Both grants converge on the same `ready_for_credential_request` state from here. See [src/mcp_oidc4vci/authorization_request.py](src/mcp_oidc4vci/authorization_request.py), [src/mcp_oidc4vci/pushed_authorization_request.py](src/mcp_oidc4vci/pushed_authorization_request.py), and [src/mcp_oidc4vci/pkce.py](src/mcp_oidc4vci/pkce.py).
+
+**Wallet boundary.** `WalletAdapter` (a `Protocol` with `generate_proof` and `receive_credential`) backs `request_credential`, which completes the Credential Request for a `ready_for_credential_request` session: fetch issuer metadata, get a fresh nonce if the issuer needs one, ask the wallet for a signed proof (a real EC-signed `openid4vci-proof+jwt`, never signed by this server), send it — DPoP-bound if the session's access token is — and hand the issued credential to the wallet, whose contents never reach the agent. The bundled `MockWalletAdapter` makes both grants work end to end for local testing. See [src/mcp_oidc4vci/wallet.py](src/mcp_oidc4vci/wallet.py), [src/mcp_oidc4vci/credential_request.py](src/mcp_oidc4vci/credential_request.py), and [src/mcp_oidc4vci/nonce.py](src/mcp_oidc4vci/nonce.py).
 
 **Manual wallet handoff.** `request_wallet_proof` / `submit_wallet_proof` split the Credential Request into two tool calls for when the proof must come from something other than the in-process `MockWalletAdapter` — a real wallet, or a human signing by hand — without needing any blocking-wait or webhook machinery: the handoff happens through the session, the same way `initiate_issuance` → `get_issuance_status` already does. `request_credential` (the automatic path) is unchanged and still there for fast, fully-automated testing. See [Architecture](docs/ARCHITECTURE.md#request_wallet_proof-and-submit_wallet_proof) for the design reasoning.
 
-Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 173 tests).
+Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 239 tests).
 
 ---
 
@@ -101,6 +129,10 @@ uv run scripts/sign_proof.py --audience https://issuer.example.com --nonce abc12
 ```
 
 Pass its output straight to `submit_wallet_proof`'s `proof_jwt` argument.
+
+### Testing the authorization code grant
+
+This server has no HTTP endpoint of its own to receive a browser redirect (see [Architecture](docs/ARCHITECTURE.md#begin_authorization-and-submit_authorization_result)), so completing this grant needs a real Authorization Server, a `client_id`/`redirect_uri` registered with it, and a browser: call `begin_authorization`, open the returned `authorization_url`, authenticate, and copy the `code`/`state` query parameters from wherever the browser lands after the redirect into `submit_authorization_result`.
 
 ---
 

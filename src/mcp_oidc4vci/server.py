@@ -13,7 +13,6 @@ from mcp_oidc4vci.credential_issuer_metadata import (
     get_credential_issuer_metadata as fetch_credential_issuer_metadata,
 )
 from mcp_oidc4vci.credential_offer import InvalidCredentialOfferError, resolve_credential_offer
-from mcp_oidc4vci.credential_request import SessionNotReadyError
 from mcp_oidc4vci.credential_request import request_credential as fetch_credential
 from mcp_oidc4vci.credential_request import request_wallet_proof as begin_wallet_proof
 from mcp_oidc4vci.credential_request import submit_wallet_proof as finish_wallet_proof
@@ -21,10 +20,13 @@ from mcp_oidc4vci.issuance import (
     IssuanceSession,
     IssuanceSessionNotFoundError,
     IssuanceSessionStore,
+    SessionNotReadyError,
     UndeterminedIssuanceFlowError,
 )
+from mcp_oidc4vci.issuance import begin_authorization as begin_authorization_flow
 from mcp_oidc4vci.issuance import describe_issuance_flow as build_issuance_flow_description
 from mcp_oidc4vci.issuance import initiate_issuance as start_issuance
+from mcp_oidc4vci.issuance import submit_authorization_result as finish_authorization
 from mcp_oidc4vci.wallet import MockWalletAdapter
 
 logger = logging.getLogger(__name__)
@@ -84,13 +86,58 @@ async def initiate_issuance(credential_offer: str, tx_code: str | None = None) -
 
     For the pre-authorized code grant, completes the token exchange immediately and the
     session ends `ready_for_credential_request` or `failed`. For the authorization code
-    grant, the session is left `waiting_for_user_authorization`, since completing it requires
-    a wallet-driven redirect not yet implemented. `tx_code` is the transaction code obtained
-    from the user out-of-band, if the offer requires one.
+    grant, this resolves the Authorization Server's metadata and leaves the session
+    `waiting_for_user_authorization`; call `begin_authorization` next. `tx_code` is the
+    transaction code obtained from the user out-of-band, if the offer requires one.
     """
     try:
         session = await start_issuance(credential_offer, sessions=_sessions, tx_code=tx_code)
     except (InvalidCredentialOfferError, UndeterminedIssuanceFlowError) as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
+@mcp.tool
+async def begin_authorization(session_id: str, client_id: str, redirect_uri: str) -> dict[str, Any]:
+    """Build the Authorization Request URL for a session waiting on the authorization code
+    grant (`status == "waiting_for_user_authorization"`).
+
+    `client_id` and `redirect_uri` must be whatever you've registered (or otherwise arranged)
+    with the Authorization Server — this server has no client registration of its own to
+    supply them for you. Returns the URL for a human to open and complete; the session moves
+    to `awaiting_authorization_result`. This server cannot receive the resulting redirect
+    itself, so once it completes, call submit_authorization_result with the `code` and
+    `state` query parameters the redirect target ends up carrying.
+
+    Hand the URL to the human immediately, and ask them to open it right away: when the
+    Authorization Server requires Pushed Authorization Requests (RFC 9126), the URL embeds a
+    `request_uri` that can expire in well under a minute — a real Authorization Server has
+    been observed expiring one in about 60 seconds. If authorization fails with something
+    like "invalid request" before the human even reaches a login page, the `request_uri` most
+    likely expired; just call begin_authorization again for a fresh one rather than retrying
+    the same URL.
+    """
+    try:
+        session = await begin_authorization_flow(
+            session_id, client_id=client_id, redirect_uri=redirect_uri, sessions=_sessions
+        )
+    except (IssuanceSessionNotFoundError, SessionNotReadyError) as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
+@mcp.tool
+async def submit_authorization_result(session_id: str, code: str, state: str) -> dict[str, Any]:
+    """Complete the authorization code grant using the `code` and `state` obtained by opening
+    the URL from `begin_authorization` and completing the redirect.
+
+    A `state` that doesn't match what `begin_authorization` issued fails the session without
+    making a Token Request. On success, the session ends `ready_for_credential_request` or
+    `failed`, exactly like the pre-authorized code grant.
+    """
+    try:
+        session = await finish_authorization(session_id, code, state, sessions=_sessions)
+    except (IssuanceSessionNotFoundError, SessionNotReadyError) as exc:
         raise ToolError(str(exc)) from exc
     return _issuance_session_output(session)
 
@@ -191,6 +238,8 @@ def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
         if session.proof_nonce is not None:
             proof_request["nonce"] = session.proof_nonce
         output["proof_request"] = proof_request
+    if session.status == "awaiting_authorization_result" and session.authorization_url is not None:
+        output["authorization_url"] = session.authorization_url
     return output
 
 

@@ -1,5 +1,5 @@
 import json
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pytest
 
@@ -8,10 +8,13 @@ from mcp_oidc4vci.issuance import (
     AUTHORIZATION_CODE_FLOW,
     IssuanceSessionNotFoundError,
     IssuanceSessionStore,
+    SessionNotReadyError,
     UndeterminedIssuanceFlowError,
+    begin_authorization,
     describe_issuance_flow,
     initiate_issuance,
     select_flow_type,
+    submit_authorization_result,
 )
 from mcp_oidc4vci.models import (
     PRE_AUTHORIZED_CODE_GRANT_TYPE,
@@ -266,22 +269,616 @@ async def test_session_store_does_not_evict_sessions_within_their_ttl() -> None:
 # -- initiate_issuance: authorization_code grant ------------------------------
 
 
-async def test_initiate_issuance_for_authorization_code_needs_no_network_calls() -> None:
-    payload = (
+def _authorization_code_offer_json(
+    *, authorization_server: str | None = None, issuer_state: str | None = None
+) -> str:
+    grant: dict[str, object] = {}
+    if authorization_server is not None:
+        grant["authorization_server"] = authorization_server
+    if issuer_state is not None:
+        grant["issuer_state"] = issuer_state
+    return (
         f'{{"credential_issuer": "{ISSUER}", '
         '"credential_configuration_ids": ["UniversityDegreeCredential"], '
-        '"grants": {"authorization_code": {}}}'
+        f'"grants": {{"authorization_code": {json.dumps(grant)}}}}}'
     )
 
+
+async def _as_metadata_with_authorization_endpoint(url: str) -> str:
+    return (
+        f'{{"issuer": "{ISSUER}", "token_endpoint": "{ISSUER}/token", '
+        f'"authorization_endpoint": "{ISSUER}/authorize"}}'
+    )
+
+
+async def _issuer_metadata_with_scope(url: str) -> str:
+    return (
+        f'{{"credential_issuer": "{ISSUER}", '
+        f'"credential_endpoint": "{ISSUER}/credential", '
+        '"credential_configurations_supported": {"UniversityDegreeCredential": '
+        '{"format": "vc+sd-jwt", "scope": "university_degree"}}}'
+    )
+
+
+async def _issuer_metadata_without_scope(url: str) -> str:
+    return (
+        f'{{"credential_issuer": "{ISSUER}", '
+        f'"credential_endpoint": "{ISSUER}/credential", '
+        '"credential_configurations_supported": {"UniversityDegreeCredential": '
+        '{"format": "vc+sd-jwt"}}}'
+    )
+
+
+async def test_initiate_issuance_resolves_as_metadata_for_the_authorization_code_grant() -> None:
     session = await initiate_issuance(
-        _offer_uri(payload),
+        _offer_uri(_authorization_code_offer_json()),
         sessions=IssuanceSessionStore(),
-        fetch_as_metadata=_fail_if_fetched,
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
         post_token_request=_fail_if_posted,
     )
 
     assert session.status == "waiting_for_user_authorization"
     assert session.flow_type == AUTHORIZATION_CODE_FLOW
+    assert session.authorization_endpoint == f"{ISSUER}/authorize"
+    assert session.token_endpoint == f"{ISSUER}/token"
+
+
+async def test_initiate_issuance_uses_the_grants_authorization_server_hint_for_auth_code() -> None:
+    requested_urls: list[str] = []
+
+    async def fake_as_metadata(url: str) -> str:
+        requested_urls.append(url)
+        return (
+            '{"issuer": "https://as.example.com", '
+            '"token_endpoint": "https://as.example.com/token", '
+            '"authorization_endpoint": "https://as.example.com/authorize"}'
+        )
+
+    await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json(authorization_server="https://as.example.com")),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=fake_as_metadata,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+
+    assert requested_urls == ["https://as.example.com/.well-known/oauth-authorization-server"]
+
+
+async def test_initiate_issuance_passes_through_the_issuer_state() -> None:
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json(issuer_state="opaque-issuer-state")),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+
+    assert session.issuer_state == "opaque-issuer-state"
+
+
+async def test_initiate_issuance_stores_the_par_endpoint_when_advertised() -> None:
+    async def as_metadata_with_par(url: str) -> str:
+        return (
+            f'{{"issuer": "{ISSUER}", "token_endpoint": "{ISSUER}/token", '
+            f'"authorization_endpoint": "{ISSUER}/authorize", '
+            f'"pushed_authorization_request_endpoint": "{ISSUER}/par"}}'
+        )
+
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=as_metadata_with_par,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+
+    assert session.pushed_authorization_request_endpoint == f"{ISSUER}/par"
+
+
+async def test_initiate_issuance_leaves_par_endpoint_unset_when_not_advertised() -> None:
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+
+    assert session.pushed_authorization_request_endpoint is None
+
+
+async def test_initiate_issuance_resolves_scope_from_credential_issuer_metadata() -> None:
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+
+    assert session.scope == "university_degree"
+
+
+async def test_initiate_issuance_leaves_scope_unset_when_the_configuration_has_none() -> None:
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_without_scope,
+    )
+
+    assert session.scope is None
+
+
+async def test_initiate_issuance_fails_the_session_when_credential_issuer_metadata_is_invalid() -> (
+    None
+):
+    async def broken_issuer_metadata(url: str) -> str:
+        return "not-json"
+
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=broken_issuer_metadata,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+
+
+async def test_initiate_issuance_fails_the_session_when_as_metadata_is_invalid_for_auth_code() -> (
+    None
+):
+    async def broken_as_metadata(url: str) -> str:
+        return "not-json"
+
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=broken_as_metadata,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+
+
+async def test_initiate_issuance_fails_the_session_when_as_has_no_authorization_endpoint() -> None:
+    async def as_metadata_without_authorization_endpoint(url: str) -> str:
+        return f'{{"issuer": "{ISSUER}", "token_endpoint": "{ISSUER}/token"}}'
+
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=as_metadata_without_authorization_endpoint,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+    assert "authorization_endpoint" in session.error
+
+
+async def test_initiate_issuance_generates_a_dpop_key_for_the_authorization_code_grant() -> None:
+    async def as_metadata_with_dpop(url: str) -> str:
+        return (
+            f'{{"issuer": "{ISSUER}", "token_endpoint": "{ISSUER}/token", '
+            f'"authorization_endpoint": "{ISSUER}/authorize", '
+            '"dpop_signing_alg_values_supported": ["ES256"]}'
+        )
+
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=as_metadata_with_dpop,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+
+    assert session.dpop_key is not None
+
+
+async def test_initiate_issuance_skips_dpop_key_for_auth_code_grant_when_unsupported() -> None:
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=IssuanceSessionStore(),
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+
+    assert session.dpop_key is None
+
+
+# -- begin_authorization -------------------------------------------------------
+
+
+async def _session_waiting_for_authorization(
+    sessions: IssuanceSessionStore, *, issuer_state: str | None = None
+) -> str:
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json(issuer_state=issuer_state)),
+        sessions=sessions,
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+    return session.session_id
+
+
+async def test_begin_authorization_builds_the_url_and_moves_the_session() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_waiting_for_authorization(sessions)
+
+    session = await begin_authorization(
+        session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+    )
+
+    assert session.status == "awaiting_authorization_result"
+    assert session.client_id == "test-client"
+    assert session.redirect_uri == "https://client.example.com/cb"
+    assert session.code_verifier is not None
+    assert session.authorization_state is not None
+    assert session.authorization_url is not None
+    assert session.authorization_url.startswith(f"{ISSUER}/authorize?")
+    query = parse_qs(urlsplit(session.authorization_url).query)
+    assert query["response_type"] == ["code"]
+    assert query["client_id"] == ["test-client"]
+    assert query["redirect_uri"] == ["https://client.example.com/cb"]
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["state"] == [session.authorization_state]
+    assert query["scope"] == ["university_degree"]
+    assert "issuer_state" not in query
+
+
+async def test_begin_authorization_includes_the_issuer_state_when_present() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_waiting_for_authorization(sessions, issuer_state="opaque-state")
+
+    session = await begin_authorization(
+        session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+    )
+
+    assert session.authorization_url is not None
+    query = parse_qs(urlsplit(session.authorization_url).query)
+    assert query["issuer_state"] == ["opaque-state"]
+
+
+async def test_begin_authorization_sends_scope_instead_of_authorization_details() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_waiting_for_authorization(sessions)
+
+    session = await begin_authorization(
+        session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+    )
+
+    assert session.authorization_url is not None
+    query = parse_qs(urlsplit(session.authorization_url).query)
+    assert query["scope"] == ["university_degree"]
+    assert "authorization_details" not in query
+
+
+async def test_begin_authorization_sends_authorization_details_when_no_scope_is_resolved() -> None:
+    sessions = IssuanceSessionStore()
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=sessions,
+        fetch_as_metadata=_as_metadata_with_authorization_endpoint,
+        fetch_issuer_metadata=_issuer_metadata_without_scope,
+    )
+
+    session = await begin_authorization(
+        session.session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+    )
+
+    assert session.authorization_url is not None
+    query = parse_qs(urlsplit(session.authorization_url).query)
+    assert "scope" not in query
+    authorization_details = json.loads(query["authorization_details"][0])
+    assert authorization_details == [
+        {"type": "openid_credential", "credential_configuration_id": "UniversityDegreeCredential"}
+    ]
+
+
+async def test_begin_authorization_raises_for_an_unknown_session() -> None:
+    with pytest.raises(IssuanceSessionNotFoundError):
+        await begin_authorization(
+            "does-not-exist",
+            client_id="test-client",
+            redirect_uri="https://client.example.com/cb",
+            sessions=IssuanceSessionStore(),
+        )
+
+
+async def test_begin_authorization_raises_when_the_session_is_not_ready() -> None:
+    sessions = IssuanceSessionStore()
+    session = await sessions.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    with pytest.raises(SessionNotReadyError):
+        await begin_authorization(
+            session.session_id,
+            client_id="test-client",
+            redirect_uri="https://client.example.com/cb",
+            sessions=sessions,
+        )
+
+
+# -- begin_authorization: PAR (RFC 9126) ---------------------------------------
+
+
+async def _session_waiting_for_authorization_with_par(sessions: IssuanceSessionStore) -> str:
+    async def as_metadata_with_par(url: str) -> str:
+        return (
+            f'{{"issuer": "{ISSUER}", "token_endpoint": "{ISSUER}/token", '
+            f'"authorization_endpoint": "{ISSUER}/authorize", '
+            f'"pushed_authorization_request_endpoint": "{ISSUER}/par"}}'
+        )
+
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=sessions,
+        fetch_as_metadata=as_metadata_with_par,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+    return session.session_id
+
+
+async def test_begin_authorization_pushes_the_request_when_the_as_supports_par() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_waiting_for_authorization_with_par(sessions)
+
+    async def fake_par_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        assert url == f"{ISSUER}/par"
+        return (
+            201,
+            {},
+            '{"request_uri": "urn:ietf:params:oauth:request_uri:abc123", "expires_in": 60}',
+        )
+
+    session = await begin_authorization(
+        session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+        post_par_request=fake_par_post,
+    )
+
+    assert session.status == "awaiting_authorization_result"
+    assert session.authorization_url is not None
+    assert session.authorization_url.startswith(f"{ISSUER}/authorize?")
+    query = parse_qs(urlsplit(session.authorization_url).query)
+    assert query == {
+        "client_id": ["test-client"],
+        "request_uri": ["urn:ietf:params:oauth:request_uri:abc123"],
+    }
+
+
+async def test_begin_authorization_sends_the_authorization_params_to_the_par_endpoint() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_waiting_for_authorization_with_par(sessions)
+    captured: dict[str, str] = {}
+
+    async def fake_par_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured.update(data)
+        return (
+            201,
+            {},
+            '{"request_uri": "urn:ietf:params:oauth:request_uri:abc123", "expires_in": 60}',
+        )
+
+    await begin_authorization(
+        session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+        post_par_request=fake_par_post,
+    )
+
+    assert captured["response_type"] == "code"
+    assert captured["client_id"] == "test-client"
+    assert captured["redirect_uri"] == "https://client.example.com/cb"
+    assert captured["code_challenge_method"] == "S256"
+    assert "code_challenge" in captured
+    assert "state" in captured
+
+
+async def test_begin_authorization_fails_the_session_when_the_par_request_is_rejected() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_waiting_for_authorization_with_par(sessions)
+
+    async def rejecting_par_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 400, {}, '{"error": "invalid_request", "error_description": "missing parameter"}'
+
+    session = await begin_authorization(
+        session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+        post_par_request=rejecting_par_post,
+    )
+
+    assert session.status == "failed"
+    assert session.error == "missing parameter"
+
+
+# -- submit_authorization_result -----------------------------------------------
+
+
+async def _session_awaiting_authorization_result(sessions: IssuanceSessionStore) -> str:
+    session_id = await _session_waiting_for_authorization(sessions)
+    session = await begin_authorization(
+        session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+    )
+    return session.session_id
+
+
+async def test_submit_authorization_result_completes_the_token_exchange_on_success() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_awaiting_authorization_result(sessions)
+    session = await sessions.get(session_id)
+    assert session.authorization_state is not None
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        assert url == f"{ISSUER}/token"
+        return 200, {}, '{"access_token": "secret-token", "token_type": "Bearer"}'
+
+    updated = await submit_authorization_result(
+        session_id,
+        "auth-code",
+        session.authorization_state,
+        sessions=sessions,
+        post_token_request=fake_post,
+    )
+
+    assert updated.status == "ready_for_credential_request"
+    assert updated.access_token == "secret-token"
+    assert updated.dpop_bound is False
+
+
+async def test_submit_authorization_result_sends_the_pkce_verifier_and_redirect_uri() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_awaiting_authorization_result(sessions)
+    session = await sessions.get(session_id)
+    assert session.authorization_state is not None
+    assert session.code_verifier is not None
+    captured: dict[str, str] = {}
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured.update(data)
+        return 200, {}, '{"access_token": "secret-token", "token_type": "Bearer"}'
+
+    await submit_authorization_result(
+        session_id,
+        "auth-code",
+        session.authorization_state,
+        sessions=sessions,
+        post_token_request=fake_post,
+    )
+
+    assert captured["grant_type"] == "authorization_code"
+    assert captured["code"] == "auth-code"
+    assert captured["redirect_uri"] == "https://client.example.com/cb"
+    assert captured["client_id"] == "test-client"
+    assert captured["code_verifier"] == session.code_verifier
+
+
+async def test_submit_authorization_result_fails_when_the_state_does_not_match() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_awaiting_authorization_result(sessions)
+
+    session = await submit_authorization_result(
+        session_id,
+        "auth-code",
+        "wrong-state",
+        sessions=sessions,
+        post_token_request=_fail_if_posted,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+    assert "state" in session.error.lower()
+
+
+async def test_submit_authorization_result_fails_when_the_token_request_is_rejected() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_awaiting_authorization_result(sessions)
+    session = await sessions.get(session_id)
+    assert session.authorization_state is not None
+
+    async def rejecting_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 400, {}, '{"error": "invalid_grant", "error_description": "code expired"}'
+
+    updated = await submit_authorization_result(
+        session_id,
+        "auth-code",
+        session.authorization_state,
+        sessions=sessions,
+        post_token_request=rejecting_post,
+    )
+
+    assert updated.status == "failed"
+    assert updated.error == "code expired"
+
+
+async def test_submit_authorization_result_raises_for_an_unknown_session() -> None:
+    with pytest.raises(IssuanceSessionNotFoundError):
+        await submit_authorization_result(
+            "does-not-exist", "auth-code", "state", sessions=IssuanceSessionStore()
+        )
+
+
+async def test_submit_authorization_result_raises_when_the_session_is_not_ready() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _session_waiting_for_authorization(sessions)
+
+    with pytest.raises(SessionNotReadyError):
+        await submit_authorization_result(session_id, "auth-code", "state", sessions=sessions)
+
+
+async def test_submit_authorization_result_attaches_dpop_when_the_as_supports_it() -> None:
+    async def as_metadata_with_dpop(url: str) -> str:
+        return (
+            f'{{"issuer": "{ISSUER}", "token_endpoint": "{ISSUER}/token", '
+            f'"authorization_endpoint": "{ISSUER}/authorize", '
+            '"dpop_signing_alg_values_supported": ["ES256"]}'
+        )
+
+    sessions = IssuanceSessionStore()
+    session = await initiate_issuance(
+        _offer_uri(_authorization_code_offer_json()),
+        sessions=sessions,
+        fetch_as_metadata=as_metadata_with_dpop,
+        fetch_issuer_metadata=_issuer_metadata_with_scope,
+    )
+    session = await begin_authorization(
+        session.session_id,
+        client_id="test-client",
+        redirect_uri="https://client.example.com/cb",
+        sessions=sessions,
+    )
+    assert session.authorization_state is not None
+    captured_headers: list[dict[str, str]] = []
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_headers.append(headers)
+        return 200, {}, '{"access_token": "secret-token", "token_type": "DPoP"}'
+
+    updated = await submit_authorization_result(
+        session.session_id,
+        "auth-code",
+        session.authorization_state,
+        sessions=sessions,
+        post_token_request=fake_post,
+    )
+
+    assert updated.dpop_bound is True
+    assert "DPoP" in captured_headers[0]
 
 
 # -- initiate_issuance: pre-authorized_code grant -----------------------------

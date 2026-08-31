@@ -1,4 +1,4 @@
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 import pytest
@@ -337,7 +337,33 @@ async def test_request_credential_surfaces_an_unknown_session_as_a_tool_error() 
             await client.call_tool("request_credential", {"session_id": "does-not-exist"})
 
 
-async def test_request_credential_surfaces_a_not_ready_session_as_a_tool_error() -> None:
+async def test_request_credential_surfaces_a_not_ready_session_as_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                    "authorization_endpoint": "https://issuer.example.com/authorize",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "credential_issuer": "https://issuer.example.com",
+                "credential_endpoint": "https://issuer.example.com/credential",
+                "credential_configurations_supported": {
+                    "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
     payload = (
         '{"credential_issuer": "https://issuer.example.com", '
         '"credential_configuration_ids": ["UniversityDegreeCredential"], '
@@ -425,7 +451,33 @@ async def test_request_wallet_proof_surfaces_a_not_ready_session_as_a_tool_error
             await client.call_tool("request_wallet_proof", {"session_id": "does-not-exist"})
 
 
-async def test_submit_wallet_proof_surfaces_a_not_awaiting_session_as_a_tool_error() -> None:
+async def test_submit_wallet_proof_surfaces_a_not_awaiting_session_as_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                    "authorization_endpoint": "https://issuer.example.com/authorize",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "credential_issuer": "https://issuer.example.com",
+                "credential_endpoint": "https://issuer.example.com/credential",
+                "credential_configurations_supported": {
+                    "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
     payload = (
         '{"credential_issuer": "https://issuer.example.com", '
         '"credential_configuration_ids": ["UniversityDegreeCredential"], '
@@ -436,9 +488,196 @@ async def test_submit_wallet_proof_surfaces_a_not_awaiting_session_as_a_tool_err
         initiate_result = await client.call_tool(
             "initiate_issuance", {"credential_offer": _offer_uri(payload)}
         )
+        assert initiate_result.data["status"] == "waiting_for_user_authorization"
         session_id = initiate_result.data["session_id"]
 
         with pytest.raises(ToolError, match="not ready"):
             await client.call_tool(
                 "submit_wallet_proof", {"session_id": session_id, "proof_jwt": "x"}
+            )
+
+
+async def test_authorization_code_grant_completes_the_full_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                    "authorization_endpoint": "https://issuer.example.com/authorize",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/credential":
+            return httpx.Response(200, json={"credentials": [{"credential": "opaque-jwt-vc"}]})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"authorization_code": {}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        assert initiate_result.data["status"] == "waiting_for_user_authorization"
+        session_id = initiate_result.data["session_id"]
+
+        begin_result = await client.call_tool(
+            "begin_authorization",
+            {
+                "session_id": session_id,
+                "client_id": "test-client",
+                "redirect_uri": "https://client.example.com/cb",
+            },
+        )
+        assert begin_result.data["status"] == "awaiting_authorization_result"
+        authorization_url = begin_result.data["authorization_url"]
+        assert authorization_url.startswith("https://issuer.example.com/authorize?")
+        state = parse_qs(urlsplit(authorization_url).query)["state"][0]
+
+        submit_result = await client.call_tool(
+            "submit_authorization_result",
+            {"session_id": session_id, "code": "auth-code", "state": state},
+        )
+        assert submit_result.data["status"] == "ready_for_credential_request"
+
+        request_result = await client.call_tool(
+            "request_credential", {"session_id": session_id}
+        )
+
+    assert request_result.data == {"session_id": session_id, "status": "completed"}
+
+
+async def test_begin_authorization_surfaces_an_unknown_session_as_a_tool_error() -> None:
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="No issuance session"):
+            await client.call_tool(
+                "begin_authorization",
+                {
+                    "session_id": "does-not-exist",
+                    "client_id": "test-client",
+                    "redirect_uri": "https://client.example.com/cb",
+                },
+            )
+
+
+async def test_begin_authorization_surfaces_a_not_ready_session_as_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(200, json={"access_token": "secret-token", "token_type": "Bearer"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        assert initiate_result.data["status"] == "ready_for_credential_request"
+
+        with pytest.raises(ToolError, match="not ready"):
+            await client.call_tool(
+                "begin_authorization",
+                {
+                    "session_id": initiate_result.data["session_id"],
+                    "client_id": "test-client",
+                    "redirect_uri": "https://client.example.com/cb",
+                },
+            )
+
+
+async def test_submit_authorization_result_surfaces_an_unknown_session_as_a_tool_error() -> None:
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="No issuance session"):
+            await client.call_tool(
+                "submit_authorization_result",
+                {"session_id": "does-not-exist", "code": "auth-code", "state": "x"},
+            )
+
+
+async def test_submit_authorization_result_surfaces_a_not_ready_session_as_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                    "authorization_endpoint": "https://issuer.example.com/authorize",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "credential_issuer": "https://issuer.example.com",
+                "credential_endpoint": "https://issuer.example.com/credential",
+                "credential_configurations_supported": {
+                    "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"authorization_code": {}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        assert initiate_result.data["status"] == "waiting_for_user_authorization"
+
+        with pytest.raises(ToolError, match="not ready"):
+            await client.call_tool(
+                "submit_authorization_result",
+                {
+                    "session_id": initiate_result.data["session_id"],
+                    "code": "auth-code",
+                    "state": "x",
+                },
             )

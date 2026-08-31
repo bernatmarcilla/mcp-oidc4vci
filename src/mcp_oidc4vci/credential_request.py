@@ -16,7 +16,7 @@ from mcp_oidc4vci.credential_issuer_metadata import (
     MetadataFetcher,
     get_credential_issuer_metadata,
 )
-from mcp_oidc4vci.issuance import IssuanceSession, IssuanceSessionStore
+from mcp_oidc4vci.issuance import IssuanceSession, IssuanceSessionStore, SessionNotReadyError
 from mcp_oidc4vci.models import (
     CredentialErrorResponse,
     CredentialIssuerMetadata,
@@ -39,10 +39,6 @@ _DPOP_NONCE_ERROR = 'error="use_dpop_nonce"'
 
 class CredentialRequestError(Exception):
     """Base error for problems performing a Credential Request."""
-
-
-class SessionNotReadyError(CredentialRequestError):
-    """The session is not in a state that allows a Credential Request."""
 
 
 class CredentialRequestRejectedError(CredentialRequestError):

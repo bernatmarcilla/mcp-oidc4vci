@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 PRE_AUTHORIZED_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+AUTHORIZATION_CODE_GRANT_TYPE = "authorization_code"
 
 
 class TxCode(BaseModel):
@@ -100,9 +101,30 @@ class AuthorizationServerMetadata(BaseModel):
 
     issuer: str
     token_endpoint: str
+    # Required for the authorization_code grant (RFC 8414 §2 notes it's optional in general,
+    # but an AS that doesn't advertise one can't support that grant here).
+    authorization_endpoint: str | None = None
+    # RFC 9126 §5. Presence is the signal to push the Authorization Request's parameters
+    # instead of putting them directly in its URL — always safe to do when the AS advertises
+    # support, whether or not it's mandatory for that AS.
+    pushed_authorization_request_endpoint: str | None = None
     # RFC 9449 §5.1. Presence signals DPoP support; used to decide whether to proactively
     # attach a DPoP proof to the Token Request.
     dpop_signing_alg_values_supported: list[str] | None = None
+
+
+class PushedAuthorizationRequestResponse(BaseModel):
+    """A successful Pushed Authorization Request Response (RFC 9126 §2.2)."""
+
+    request_uri: str
+    expires_in: int
+
+
+class PushedAuthorizationRequestErrorResponse(BaseModel):
+    """A Pushed Authorization Request Error Response (RFC 9126 §2.3)."""
+
+    error: str
+    error_description: str | None = None
 
 
 class TokenSuccessResponse(BaseModel):

@@ -10,6 +10,8 @@ from mcp_oidc4vci.models import (
     CredentialOfferGrants,
     IssuanceFlowDescription,
     PreAuthorizedCodeGrant,
+    PushedAuthorizationRequestErrorResponse,
+    PushedAuthorizationRequestResponse,
     TokenErrorResponse,
     TokenSuccessResponse,
 )
@@ -160,6 +162,50 @@ def test_authorization_server_metadata_parses_dpop_signing_algs() -> None:
     )
 
     assert metadata.dpop_signing_alg_values_supported == ["ES256"]
+
+
+def test_authorization_server_metadata_authorization_and_par_endpoints_default_to_absent() -> (
+    None
+):
+    metadata = AuthorizationServerMetadata.model_validate(
+        {"issuer": "https://as.example.com", "token_endpoint": "https://as.example.com/token"}
+    )
+
+    assert metadata.authorization_endpoint is None
+    assert metadata.pushed_authorization_request_endpoint is None
+
+
+def test_authorization_server_metadata_parses_authorization_and_par_endpoints() -> None:
+    metadata = AuthorizationServerMetadata.model_validate(
+        {
+            "issuer": "https://as.example.com",
+            "token_endpoint": "https://as.example.com/token",
+            "authorization_endpoint": "https://as.example.com/authorize",
+            "pushed_authorization_request_endpoint": "https://as.example.com/par",
+        }
+    )
+
+    assert metadata.authorization_endpoint == "https://as.example.com/authorize"
+    assert metadata.pushed_authorization_request_endpoint == "https://as.example.com/par"
+
+
+def test_pushed_authorization_request_response_requires_request_uri_and_expires_in() -> None:
+    with pytest.raises(ValidationError):
+        PushedAuthorizationRequestResponse.model_validate({"request_uri": "urn:...:abc"})
+
+
+def test_pushed_authorization_request_response_parses_a_valid_payload() -> None:
+    response = PushedAuthorizationRequestResponse.model_validate(
+        {"request_uri": "urn:ietf:params:oauth:request_uri:abc123", "expires_in": 60}
+    )
+
+    assert response.request_uri == "urn:ietf:params:oauth:request_uri:abc123"
+    assert response.expires_in == 60
+
+
+def test_pushed_authorization_request_error_response_requires_error() -> None:
+    with pytest.raises(ValidationError):
+        PushedAuthorizationRequestErrorResponse.model_validate({})
 
 
 def test_token_success_response_requires_access_token_and_token_type() -> None:

@@ -7,6 +7,7 @@ from mcp_oidc4vci.dpop import DPoPKey
 from mcp_oidc4vci.token_request import (
     InvalidTokenResponseError,
     TokenRequestRejectedError,
+    request_token_with_authorization_code,
     request_token_with_pre_authorized_code,
 )
 from support import mock_async_client
@@ -256,3 +257,97 @@ async def test_does_not_retry_a_use_dpop_nonce_error_without_a_dpop_key() -> Non
         )
 
     assert call_count == 1
+
+
+# -- authorization_code grant --------------------------------------------------
+
+
+async def test_authorization_code_sends_the_expected_form_parameters() -> None:
+    captured: dict[str, str] = {}
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured.update(data)
+        captured["__url__"] = url
+        return 200, {}, _SUCCESS_BODY
+
+    await request_token_with_authorization_code(
+        "https://as.example.com/token",
+        "auth-code",
+        redirect_uri="https://client.example.com/cb",
+        client_id="client-id",
+        code_verifier="verifier-value",
+        post=fake_post,
+    )
+
+    assert captured == {
+        "__url__": "https://as.example.com/token",
+        "grant_type": "authorization_code",
+        "code": "auth-code",
+        "redirect_uri": "https://client.example.com/cb",
+        "client_id": "client-id",
+        "code_verifier": "verifier-value",
+    }
+
+
+async def test_authorization_code_returns_the_access_token_on_success() -> None:
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 200, {}, _SUCCESS_BODY
+
+    token = await request_token_with_authorization_code(
+        "https://as.example.com/token",
+        "auth-code",
+        redirect_uri="https://client.example.com/cb",
+        client_id="client-id",
+        code_verifier="verifier-value",
+        post=fake_post,
+    )
+
+    assert token.access_token == "abc123"
+
+
+async def test_authorization_code_raises_token_request_rejected_for_an_oauth_error_response() -> (
+    None
+):
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 400, {}, '{"error": "invalid_grant", "error_description": "code expired"}'
+
+    with pytest.raises(TokenRequestRejectedError, match="code expired"):
+        await request_token_with_authorization_code(
+            "https://as.example.com/token",
+            "auth-code",
+            redirect_uri="https://client.example.com/cb",
+            client_id="client-id",
+            code_verifier="verifier-value",
+            post=fake_post,
+        )
+
+
+async def test_authorization_code_attaches_a_dpop_proof_when_a_key_is_given() -> None:
+    captured_headers: dict[str, str] = {}
+
+    async def fake_post(
+        url: str, data: dict[str, str], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_headers.update(headers)
+        return 200, {}, '{"access_token": "abc123", "token_type": "DPoP"}'
+
+    await request_token_with_authorization_code(
+        "https://as.example.com/token",
+        "auth-code",
+        redirect_uri="https://client.example.com/cb",
+        client_id="client-id",
+        code_verifier="verifier-value",
+        dpop_key=DPoPKey(),
+        post=fake_post,
+    )
+
+    proof = captured_headers["DPoP"]
+    claims = jwt.decode(proof, options={"verify_signature": False})
+    assert claims["htm"] == "POST"
+    assert claims["htu"] == "https://as.example.com/token"

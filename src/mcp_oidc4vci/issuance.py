@@ -7,29 +7,51 @@ one issuance (`initiate_issuance` followed by one or more `get_issuance_status` 
 
 import asyncio
 import logging
+import secrets
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from mcp_oidc4vci.authorization_request import (
+    authorization_request_params,
+    build_authorization_url,
+    build_pushed_authorization_url,
+)
 from mcp_oidc4vci.authorization_server_metadata import (
     InvalidAuthorizationServerMetadataError,
     MetadataFetcher,
     get_authorization_server_metadata,
+)
+from mcp_oidc4vci.credential_issuer_metadata import (
+    InvalidCredentialIssuerMetadataError,
+    get_credential_issuer_metadata,
+)
+from mcp_oidc4vci.credential_issuer_metadata import (
+    MetadataFetcher as CredentialIssuerMetadataFetcher,
 )
 from mcp_oidc4vci.credential_offer import CredentialOfferFetcher, resolve_credential_offer
 from mcp_oidc4vci.dpop import SUPPORTED_DPOP_SIGNING_ALG, DPoPKey
 from mcp_oidc4vci.models import (
     PRE_AUTHORIZED_CODE_GRANT_TYPE,
     AuthorizationServerMetadata,
+    CredentialIssuerMetadata,
     CredentialOffer,
     IssuanceFlowDescription,
     IssuanceFlowStep,
+)
+from mcp_oidc4vci.pkce import code_challenge, generate_code_verifier
+from mcp_oidc4vci.pushed_authorization_request import (
+    InvalidPushedAuthorizationRequestResponseError,
+    PushedAuthorizationRequester,
+    PushedAuthorizationRequestRejectedError,
+    push_authorization_request,
 )
 from mcp_oidc4vci.token_request import (
     InvalidTokenResponseError,
     TokenRequester,
     TokenRequestRejectedError,
+    request_token_with_authorization_code,
     request_token_with_pre_authorized_code,
 )
 
@@ -89,6 +111,10 @@ class IssuanceSessionNotFoundError(IssuanceError):
     """No issuance session exists for the given session_id."""
 
 
+class SessionNotReadyError(IssuanceError):
+    """The session is not in a state that allows the requested operation."""
+
+
 def select_flow_type(offer: CredentialOffer) -> str:
     """Pick which declared grant to use (spec: "at the Wallet's discretion" when more than
     one is present). Prefers the pre-authorized code grant, since it needs no interactive
@@ -128,6 +154,23 @@ class IssuanceSession:
     `dpop_bound` carry the RFC 9449 DPoP key generated for this session (when the
     Authorization Server advertises support) and whether the resulting access token ended
     up DPoP-bound, so a later `request_credential` call can present it the same way.
+
+    The remaining fields exist only for the `authorization_code` grant, which — unlike the
+    pre-authorized code grant — spans three separate tool calls (`initiate_issuance` ->
+    `begin_authorization` -> `submit_authorization_result`) and so needs somewhere to keep
+    state between them: `authorization_endpoint`/`token_endpoint`/`issuer_state` are resolved
+    from Authorization Server metadata up front; `pushed_authorization_request_endpoint`,
+    when the Authorization Server advertises one (RFC 9126), is also resolved up front, and
+    is what tells `begin_authorization` whether to push the Authorization Request instead of
+    putting its parameters directly in the URL; `scope`, resolved from the requested credential
+    configurations' own declared `scope` (Credential Issuer Metadata), is the backward-
+    compatible alternative to `authorization_details` sent alongside it, for an Authorization
+    Server that doesn't support Rich Authorization Requests; `client_id`/`redirect_uri`/
+    `code_verifier` are chosen by `begin_authorization` and must be replayed identically in the
+    later Token Request; `authorization_state` is compared against what
+    `submit_authorization_result` receives back, to guard against cross-session mixups;
+    `authorization_url` is surfaced to the caller while `status == "awaiting_authorization_result"`,
+    the same way `proof_nonce` is surfaced for `awaiting_wallet_proof`.
     """
 
     session_id: str
@@ -141,6 +184,16 @@ class IssuanceSession:
     dpop_key: DPoPKey | None = None
     dpop_bound: bool = False
     created_at: float = field(default_factory=time.monotonic)
+    authorization_endpoint: str | None = None
+    token_endpoint: str | None = None
+    issuer_state: str | None = None
+    pushed_authorization_request_endpoint: str | None = None
+    scope: str | None = None
+    client_id: str | None = None
+    redirect_uri: str | None = None
+    code_verifier: str | None = None
+    authorization_state: str | None = None
+    authorization_url: str | None = None
 
 
 class IssuanceSessionStore:
@@ -209,6 +262,16 @@ class IssuanceSessionStore:
         proof_nonce: str | None = None,
         dpop_key: DPoPKey | None = None,
         dpop_bound: bool | None = None,
+        authorization_endpoint: str | None = None,
+        token_endpoint: str | None = None,
+        issuer_state: str | None = None,
+        pushed_authorization_request_endpoint: str | None = None,
+        scope: str | None = None,
+        client_id: str | None = None,
+        redirect_uri: str | None = None,
+        code_verifier: str | None = None,
+        authorization_state: str | None = None,
+        authorization_url: str | None = None,
     ) -> IssuanceSession:
         async with self._lock:
             self._evict_expired_locked()
@@ -224,6 +287,28 @@ class IssuanceSessionStore:
                 session.dpop_key = dpop_key
             if dpop_bound is not None:
                 session.dpop_bound = dpop_bound
+            if authorization_endpoint is not None:
+                session.authorization_endpoint = authorization_endpoint
+            if token_endpoint is not None:
+                session.token_endpoint = token_endpoint
+            if issuer_state is not None:
+                session.issuer_state = issuer_state
+            if pushed_authorization_request_endpoint is not None:
+                session.pushed_authorization_request_endpoint = (
+                    pushed_authorization_request_endpoint
+                )
+            if scope is not None:
+                session.scope = scope
+            if client_id is not None:
+                session.client_id = client_id
+            if redirect_uri is not None:
+                session.redirect_uri = redirect_uri
+            if code_verifier is not None:
+                session.code_verifier = code_verifier
+            if authorization_state is not None:
+                session.authorization_state = authorization_state
+            if authorization_url is not None:
+                session.authorization_url = authorization_url
             return session
 
     async def get(self, session_id: str) -> IssuanceSession:
@@ -242,15 +327,18 @@ async def initiate_issuance(
     tx_code: str | None = None,
     fetch_offer: CredentialOfferFetcher | None = None,
     fetch_as_metadata: MetadataFetcher | None = None,
+    fetch_issuer_metadata: CredentialIssuerMetadataFetcher | None = None,
     post_token_request: TokenRequester | None = None,
 ) -> IssuanceSession:
     """Start an issuance session for the offer's chosen flow.
 
     For the pre-authorized code grant, completes the token exchange immediately (it needs no
     user interaction); the session ends "ready_for_credential_request" or "failed". For the
-    authorization code grant, the session is left "waiting_for_user_authorization" — that flow
-    requires a wallet-driven redirect, which is out of scope until the wallet boundary
-    (roadmap Phase 4) exists.
+    authorization code grant, this resolves the Authorization Server's metadata (so a bad
+    `authorization_server` hint or a missing `authorization_endpoint` fails fast) and leaves
+    the session "waiting_for_user_authorization" — completing it needs `begin_authorization`
+    followed by `submit_authorization_result`, since a wallet-driven browser redirect can't
+    happen inside a single tool call.
     """
     offer = await resolve_credential_offer(credential_offer, fetch=fetch_offer)
     flow_type = select_flow_type(offer)
@@ -261,7 +349,13 @@ async def initiate_issuance(
     )
 
     if flow_type == AUTHORIZATION_CODE_FLOW:
-        return await sessions.update(session.session_id, status="waiting_for_user_authorization")
+        return await _prepare_authorization_code_flow(
+            offer,
+            session,
+            sessions,
+            fetch_as_metadata=fetch_as_metadata,
+            fetch_issuer_metadata=fetch_issuer_metadata,
+        )
 
     return await _complete_pre_authorized_code_flow(
         offer,
@@ -336,3 +430,227 @@ def _dpop_signing_alg_supported(as_metadata: AuthorizationServerMetadata) -> boo
     # spec-defined signal to proactively attach a DPoP proof rather than wait for a rejection.
     algs = as_metadata.dpop_signing_alg_values_supported
     return algs is not None and SUPPORTED_DPOP_SIGNING_ALG in algs
+
+
+async def _prepare_authorization_code_flow(
+    offer: CredentialOffer,
+    session: IssuanceSession,
+    sessions: IssuanceSessionStore,
+    *,
+    fetch_as_metadata: MetadataFetcher | None,
+    fetch_issuer_metadata: CredentialIssuerMetadataFetcher | None,
+) -> IssuanceSession:
+    assert offer.grants is not None
+    grant = offer.grants.authorization_code
+    assert grant is not None
+
+    # Same spec default as the pre-authorized code grant: absent its own hint, the Credential
+    # Issuer's identifier is also the Authorization Server's identifier.
+    authorization_server = grant.authorization_server or offer.credential_issuer
+
+    try:
+        as_metadata = await get_authorization_server_metadata(
+            authorization_server, fetch=fetch_as_metadata
+        )
+    except InvalidAuthorizationServerMetadataError as exc:
+        logger.warning(
+            "Session %s failed resolving Authorization Server metadata: %s",
+            session.session_id,
+            exc,
+        )
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    if as_metadata.authorization_endpoint is None:
+        error = (
+            f"Authorization Server {authorization_server!r} does not advertise an "
+            "authorization_endpoint; the authorization_code grant cannot proceed."
+        )
+        return await sessions.update(session.session_id, status="failed", error=error)
+
+    # Needed to resolve `scope` below — the Authorization Request's backward-compatible
+    # alternative to `authorization_details` — and, since it's fetched anyway, validated
+    # up front rather than only when `request_credential` needs it later.
+    try:
+        issuer_metadata = await get_credential_issuer_metadata(
+            offer.credential_issuer, fetch=fetch_issuer_metadata
+        )
+    except InvalidCredentialIssuerMetadataError as exc:
+        logger.warning(
+            "Session %s failed resolving Credential Issuer Metadata: %s",
+            session.session_id,
+            exc,
+        )
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    dpop_key = DPoPKey() if _dpop_signing_alg_supported(as_metadata) else None
+    return await sessions.update(
+        session.session_id,
+        status="waiting_for_user_authorization",
+        authorization_endpoint=as_metadata.authorization_endpoint,
+        token_endpoint=as_metadata.token_endpoint,
+        issuer_state=grant.issuer_state,
+        pushed_authorization_request_endpoint=as_metadata.pushed_authorization_request_endpoint,
+        scope=_resolve_scope(issuer_metadata, offer.credential_configuration_ids),
+        dpop_key=dpop_key,
+    )
+
+
+def _resolve_scope(
+    issuer_metadata: CredentialIssuerMetadata, credential_configuration_ids: list[str]
+) -> str | None:
+    # Spec's backward-compatible alternative to `authorization_details` (RFC 9396), for an
+    # Authorization Server that doesn't support Rich Authorization Requests. Only meaningful
+    # when every requested credential configuration declares one — a partial scope list would
+    # silently drop whichever credentials didn't, with no other way for a scope-only
+    # Authorization Server to learn about them.
+    scopes: list[str] = []
+    for credential_configuration_id in credential_configuration_ids:
+        configuration = issuer_metadata.credential_configurations_supported.get(
+            credential_configuration_id
+        )
+        if configuration is None or configuration.scope is None:
+            return None
+        scopes.append(configuration.scope)
+    return " ".join(scopes)
+
+
+async def begin_authorization(
+    session_id: str,
+    *,
+    client_id: str,
+    redirect_uri: str,
+    sessions: IssuanceSessionStore,
+    post_par_request: PushedAuthorizationRequester | None = None,
+) -> IssuanceSession:
+    """Build the Authorization Request URL for a session left `waiting_for_user_authorization`
+    by `initiate_issuance`.
+
+    `client_id` and `redirect_uri` are whatever this caller has registered (or otherwise been
+    given) with the Authorization Server — this server has no dynamic client registration of
+    its own, so it can't choose them for you. Generates a fresh PKCE pair and `state` value,
+    and stores them server-side.
+
+    When the Authorization Server advertised a `pushed_authorization_request_endpoint`
+    (RFC 9126), the parameters are pushed there first and the URL carries only the resulting
+    `request_uri`; otherwise they go directly in the URL's query string, as before — a caller
+    never needs to know or care which one happened. Either way the session moves to
+    `awaiting_authorization_result`; once a human has opened the returned URL and authorized
+    issuance, call `submit_authorization_result` with the `code`/`state` the redirect carried.
+
+    A pushed `request_uri` can be short-lived — well under a minute against at least one real
+    Authorization Server — so the URL should be handed off and opened with as little delay as
+    possible; calling this again produces a fresh one if the caller suspects it expired.
+    """
+    session = await sessions.get(session_id)
+    if session.status != "waiting_for_user_authorization" or session.authorization_endpoint is None:
+        raise SessionNotReadyError(
+            f"Session {session.session_id!r} is not ready (expected status "
+            f"'waiting_for_user_authorization' with a resolved Authorization Server, has "
+            f"status {session.status!r})."
+        )
+
+    code_verifier = generate_code_verifier()
+    state = secrets.token_urlsafe(24)
+    params = authorization_request_params(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        credential_configuration_ids=session.credential_configuration_ids,
+        code_challenge_value=code_challenge(code_verifier),
+        state=state,
+        issuer_state=session.issuer_state,
+        scope=session.scope,
+    )
+
+    if session.pushed_authorization_request_endpoint is not None:
+        try:
+            par_response = await push_authorization_request(
+                session.pushed_authorization_request_endpoint, params, post=post_par_request
+            )
+        except (
+            PushedAuthorizationRequestRejectedError,
+            InvalidPushedAuthorizationRequestResponseError,
+        ) as exc:
+            logger.warning(
+                "Session %s failed pushing the Authorization Request: %s", session.session_id, exc
+            )
+            return await sessions.update(session.session_id, status="failed", error=str(exc))
+        authorization_url = build_pushed_authorization_url(
+            session.authorization_endpoint,
+            client_id=client_id,
+            request_uri=par_response.request_uri,
+        )
+    else:
+        authorization_url = build_authorization_url(session.authorization_endpoint, params)
+
+    return await sessions.update(
+        session.session_id,
+        status="awaiting_authorization_result",
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_verifier=code_verifier,
+        authorization_state=state,
+        authorization_url=authorization_url,
+    )
+
+
+async def submit_authorization_result(
+    session_id: str,
+    code: str,
+    state: str,
+    *,
+    sessions: IssuanceSessionStore,
+    post_token_request: TokenRequester | None = None,
+) -> IssuanceSession:
+    """Complete the authorization code grant with the `code`/`state` a human obtained by
+    opening `begin_authorization`'s URL and completing the redirect.
+
+    Rejects a `state` that doesn't match the one `begin_authorization` generated for this
+    session, without ever making a Token Request — that mismatch means this isn't the
+    redirect this session is waiting for. Otherwise exchanges `code` for an access token
+    (PKCE-bound, and DPoP-bound if the Authorization Server requires it) and lands the
+    session at `ready_for_credential_request`, same as the pre-authorized code grant.
+    """
+    session = await sessions.get(session_id)
+    if session.status != "awaiting_authorization_result":
+        raise SessionNotReadyError(
+            f"Session {session.session_id!r} is not ready (expected status "
+            f"'awaiting_authorization_result', has {session.status!r})."
+        )
+
+    if state != session.authorization_state:
+        return await sessions.update(
+            session.session_id,
+            status="failed",
+            error="The returned state does not match the state issued for this session.",
+        )
+
+    assert session.token_endpoint is not None
+    assert session.redirect_uri is not None
+    assert session.client_id is not None
+    assert session.code_verifier is not None
+
+    try:
+        token = await request_token_with_authorization_code(
+            session.token_endpoint,
+            code,
+            redirect_uri=session.redirect_uri,
+            client_id=session.client_id,
+            code_verifier=session.code_verifier,
+            dpop_key=session.dpop_key,
+            post=post_token_request,
+        )
+    except (TokenRequestRejectedError, InvalidTokenResponseError) as exc:
+        logger.warning("Session %s failed during token exchange: %s", session.session_id, exc)
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    logger.info(
+        "Session %s obtained an access token (dpop_bound=%s).",
+        session.session_id,
+        token.token_type == "DPoP",
+    )
+    return await sessions.update(
+        session.session_id,
+        status="ready_for_credential_request",
+        access_token=token.access_token,
+        dpop_bound=(token.token_type == "DPoP"),
+    )

@@ -1,4 +1,5 @@
-"""OAuth 2.0 Token Request for the pre-authorized code grant (spec "Token Request")."""
+"""OAuth 2.0 Token Request for the pre-authorized code and authorization code grants
+(spec "Token Request")."""
 
 import json
 import logging
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 
 from mcp_oidc4vci.dpop import DPoPKey
 from mcp_oidc4vci.models import (
+    AUTHORIZATION_CODE_GRANT_TYPE,
     PRE_AUTHORIZED_CODE_GRANT_TYPE,
     TokenErrorResponse,
     TokenSuccessResponse,
@@ -66,6 +68,43 @@ async def request_token_with_pre_authorized_code(
     }
     if tx_code is not None:
         data["tx_code"] = tx_code
+    return await _exchange_token(token_endpoint, data, dpop_key=dpop_key, post=post)
+
+
+async def request_token_with_authorization_code(
+    token_endpoint: str,
+    code: str,
+    *,
+    redirect_uri: str,
+    client_id: str,
+    code_verifier: str,
+    dpop_key: DPoPKey | None = None,
+    post: TokenRequester | None = None,
+) -> TokenSuccessResponse:
+    """Exchange an authorization code for an access token (spec "Token Request", RFC 6749
+    §4.1.3, PKCE RFC 7636 §4.5).
+
+    `redirect_uri` and `client_id` must match what was sent in the Authorization Request;
+    `code_verifier` is the PKCE verifier whose challenge was sent there. See
+    `request_token_with_pre_authorized_code` for the `dpop_key`/`post` parameters.
+    """
+    data = {
+        "grant_type": AUTHORIZATION_CODE_GRANT_TYPE,
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": client_id,
+        "code_verifier": code_verifier,
+    }
+    return await _exchange_token(token_endpoint, data, dpop_key=dpop_key, post=post)
+
+
+async def _exchange_token(
+    token_endpoint: str,
+    data: dict[str, str],
+    *,
+    dpop_key: DPoPKey | None,
+    post: TokenRequester | None,
+) -> TokenSuccessResponse:
     poster = post or _post_token_request
 
     dpop_nonce: str | None = None

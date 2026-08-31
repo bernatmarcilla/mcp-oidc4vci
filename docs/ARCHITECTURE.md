@@ -237,7 +237,7 @@ Proof returned to protocol layer
 
 `MockWalletAdapter` implements this by generating an ephemeral EC (P-256) keypair in-process and signing a real `openid4vci-proof+jwt` per spec ("`jwt` Proof Type") — enough to exercise the full protocol round-trip against a real or test issuer. It is explicitly **not** production-safe: a real wallet holds its keys in its own security boundary (hardware-backed keystore, secure enclave, a separate signing service) and is never this MCP server itself. `receive_credential` takes custody of each issued credential; the MCP server does not retain it, and no tool ever returns a credential's contents to the agent.
 
-Two methods from the original sketch of this interface — `requestUserAuthorization()` and `prepareKeyBinding()` / `getCapabilities()` — aren't implemented yet. They become relevant once the authorization code grant is completed (needs user-facing consent) and once proof type / cryptographic binding negotiation matters (multiple proof types, key attestation).
+`prepareKeyBinding()` / `getCapabilities()` from the original sketch of this interface aren't implemented yet — they become relevant once proof type / cryptographic binding negotiation matters (multiple proof types, key attestation). `requestUserAuthorization()`, the other originally-sketched method, turned out not to belong here at all: completing the authorization code grant ([`begin_authorization` / `submit_authorization_result`](#begin_authorization-and-submit_authorization_result)) needs a human to complete a browser redirect, but doesn't touch key material or credential content — the two things this boundary exists to protect — so it's implemented as ordinary MCP tools rather than routed through the Wallet Adapter.
 
 ---
 
@@ -497,7 +497,31 @@ or, on failure:
 Behavior differs by grant type:
 
 - **Pre-authorized code grant:** completes the Token Request immediately (spec "Token Request") — it needs no user interaction with an external Authorization Server. On success the session becomes `ready_for_credential_request` (the access token is held server-side); on a rejected or malformed exchange it becomes `failed` with a short `error` message.
-- **Authorization code grant:** the session is left `waiting_for_user_authorization`. Completing this flow requires a wallet-driven browser redirect and PKCE — that belongs to the Wallet Adapter, not this tool, so `initiate_issuance` deliberately stops short of it rather than fabricating an incomplete authorization URL.
+- **Authorization code grant:** resolves the Authorization Server's metadata (discovering its `authorization_endpoint`/`token_endpoint`, and failing fast if either is missing or invalid) and leaves the session `waiting_for_user_authorization`. Completing it needs a wallet-driven browser redirect, which can't happen inside a single tool call — call `begin_authorization` next.
+
+### `begin_authorization` and `submit_authorization_result`
+
+Complete the authorization code grant, split across two tool calls the same way `request_wallet_proof`/`submit_wallet_proof` split the manual credential-request path — because, just like a wallet's signature, a browser redirect can't happen synchronously inside a single tool call either.
+
+**`begin_authorization(session_id, client_id, redirect_uri)`** builds the Authorization Request URL (spec "Authorization Request"; RFC 9396 `authorization_details` naming the requested `credential_configuration_ids`; RFC 7636 PKCE with the `S256` method) for a session `initiate_issuance` left `waiting_for_user_authorization`. `client_id` and `redirect_uri` are supplied by the caller, not chosen by this server — there's no dynamic client registration here, so whatever a real client has registered with the Authorization Server has to be passed in. A fresh PKCE verifier and CSRF `state` are generated and kept server-side; the session moves to `awaiting_authorization_result` and the response carries the URL to open:
+
+```json
+{
+  "session_id": "9f1c2e40-...-b2a6",
+  "status": "awaiting_authorization_result",
+  "authorization_url": "https://as.example.com/authorize?response_type=code&client_id=...&code_challenge=...&state=..."
+}
+```
+
+**Pushed Authorization Requests (RFC 9126):** when the Authorization Server's metadata advertises a `pushed_authorization_request_endpoint`, `begin_authorization` POSTs the same parameters there instead of putting them in the URL, and builds the (much shorter) URL from the `request_uri` it gets back — `?client_id=...&request_uri=...` — rather than the full parameter set. This is the same proactive-detection pattern DPoP uses: presence of the field is the signal, so a caller never needs to know or care which path happened, and an Authorization Server with no PAR endpoint keeps working exactly as before. See [`src/mcp_oidc4vci/pushed_authorization_request.py`](../src/mcp_oidc4vci/pushed_authorization_request.py) and [`src/mcp_oidc4vci/authorization_request.py`](../src/mcp_oidc4vci/authorization_request.py). Discovered as a real requirement, not a speculative addition: a live EUDI Wallet reference environment rejected a plain Authorization Request outright with `"Pushed Authorization Request is only allowed."` A pushed `request_uri` is also short-lived (the same environment expired one in roughly 60 seconds) — there's no slack for a human to be handed the URL and open it later, unlike everything else in this manual-handoff design.
+
+**`scope` fallback (RFC 9396 compatibility):** `initiate_issuance` also resolves each requested credential configuration's own `scope` (Credential Issuer Metadata) and, when every one of them declares one, `begin_authorization` sends it *instead of* `authorization_details` rather than alongside it. Discovered the same way as PAR: the same live environment's Authorization Server client had zero RAR types configured (`"Unsupported type 'openid_credential' ... Supported values: []"`), rejecting `authorization_details` outright at token exchange despite having accepted it earlier in the flow — and it turned out to reject it even with `scope` also present, so sending both isn't actually safe. There's no metadata signal (this Authorization Server doesn't advertise `authorization_details_types_supported`, RFC 9396 §5's optional field for exactly this) to detect RAR support up front; `scope` is simply preferred whenever it's resolvable, since `authorization_details` is more precise but has nothing to fall back on if the Authorization Server doesn't understand it.
+
+**Credential Issuer Metadata as signed JWT:** the same environment's `.well-known/openid-credential-issuer` endpoint defaults to `Content-Type: application/jwt` — the entire response is a signed JWT (`typ: openidvci-issuer-metadata+jwt`, `x5c` certificate chain) rather than plain JSON. `get_credential_issuer_metadata`'s default fetcher now sends `Accept: application/json` explicitly, which this environment honors and responds to with the plain form — cheaper than parsing and verifying the signed variant, and sufficient since this server doesn't yet have a use for the signature itself.
+
+**`submit_authorization_result(session_id, code, state)`** completes the grant using the `code`/`state` a human obtained by opening that URL and completing the redirect. A `state` that doesn't match the one `begin_authorization` issued fails the session *without* making a Token Request — the mismatch means this isn't the redirect the session is actually waiting for, not a signal to guess. Otherwise it exchanges `code` for an access token (PKCE-bound via the stored verifier, and DPoP-bound if the Authorization Server requires it — the same RFC 9449 handling the pre-authorized code grant uses) and lands at `ready_for_credential_request`, converging with the pre-authorized code grant: `request_credential`/`request_wallet_proof` work identically from here regardless of which grant got the session there.
+
+**Why this server can't just receive the redirect itself:** the authorization code grant assumes *something* receives the browser's redirect — normally a wallet app with a registered URI scheme, or a web server. This MCP server is neither, and has no HTTP endpoint of its own registered as anyone's `redirect_uri`. Rather than build one prematurely (the same reasoning `request_wallet_proof`/`submit_wallet_proof` used — see below), completing the redirect is left to whoever opened the URL: copy the `code`/`state` query parameters from wherever the browser lands (even a connection-refused error page still carries them in its address bar) and hand them to `submit_authorization_result`. A real client-side integration would swap this manual step for an actual redirect listener without touching anything upstream of it.
 
 ### `get_issuance_status`
 
@@ -514,18 +538,19 @@ Session states currently in use:
 
 ```text
 created
-waiting_for_user_authorization   (authorization_code grant, awaiting the wallet boundary)
-ready_for_credential_request     (pre-authorized_code grant, token exchange succeeded)
-awaiting_wallet_proof            (request_wallet_proof called; awaiting submit_wallet_proof)
-completed                        (request_credential or submit_wallet_proof succeeded)
+waiting_for_user_authorization    (authorization_code grant, AS metadata resolved; call begin_authorization)
+awaiting_authorization_result     (begin_authorization called; awaiting submit_authorization_result)
+ready_for_credential_request      (either grant: token exchange succeeded)
+awaiting_wallet_proof             (request_wallet_proof called; awaiting submit_wallet_proof)
+completed                         (request_credential or submit_wallet_proof succeeded)
 failed
 ```
 
-The remaining states from the original design (`authorization_completed`, `waiting_for_wallet_operation`, `credential_requested`) come into play once the authorization code grant is completed and deferred issuance is supported.
+The remaining states from the original design (`waiting_for_wallet_operation`, `credential_requested`) come into play once deferred issuance is supported.
 
 Sessions are held in an in-memory, process-local store (`IssuanceSessionStore` in [`src/mcp_oidc4vci/issuance.py`](../src/mcp_oidc4vci/issuance.py)) — they don't survive a server restart and aren't shared across server instances. That's an accepted limitation for the current single-process MVP, not a spec requirement. To bound memory growth in a long-running process, each session carries a `created_at` timestamp and is evicted once it's older than `ttl_seconds` (default one hour); eviction is lazy — swept on the next `create`/`update`/`get` call rather than by a background task — and an expired `session_id` behaves exactly like an unknown one.
 
-`describe_issuance_flow`, `initiate_issuance`, and `get_issuance_status` are implemented in [`src/mcp_oidc4vci/issuance.py`](../src/mcp_oidc4vci/issuance.py), which relies on [`src/mcp_oidc4vci/authorization_server_metadata.py`](../src/mcp_oidc4vci/authorization_server_metadata.py) (RFC 8414 discovery of the token endpoint) and [`src/mcp_oidc4vci/token_request.py`](../src/mcp_oidc4vci/token_request.py) (the pre-authorized code Token Request).
+`describe_issuance_flow`, `initiate_issuance`, `begin_authorization`, `submit_authorization_result`, and `get_issuance_status` are implemented in [`src/mcp_oidc4vci/issuance.py`](../src/mcp_oidc4vci/issuance.py), which relies on [`src/mcp_oidc4vci/authorization_server_metadata.py`](../src/mcp_oidc4vci/authorization_server_metadata.py) (RFC 8414 discovery of the token/authorization/PAR endpoints), [`src/mcp_oidc4vci/token_request.py`](../src/mcp_oidc4vci/token_request.py) (the Token Request for both grants), [`src/mcp_oidc4vci/authorization_request.py`](../src/mcp_oidc4vci/authorization_request.py) (building the Authorization Request's parameters and URL), [`src/mcp_oidc4vci/pushed_authorization_request.py`](../src/mcp_oidc4vci/pushed_authorization_request.py) (RFC 9126 PAR), and [`src/mcp_oidc4vci/pkce.py`](../src/mcp_oidc4vci/pkce.py) (RFC 7636 verifier/challenge generation).
 
 ### `request_credential`
 
@@ -668,7 +693,26 @@ If the user agrees, the agent calls `initiate_issuance`:
 }
 ```
 
-At this point, the application hands control to the appropriate authorization or wallet interaction.
+The agent calls `begin_authorization` with a `client_id`/`redirect_uri` it has (from configuration, or asked of the user), gets back a URL, and tells the user to open it and authorize issuance:
+
+```json
+{
+  "session_id": "issuance_123",
+  "status": "awaiting_authorization_result",
+  "authorization_url": "https://issuer.example.com/authorize?response_type=code&..."
+}
+```
+
+Once the user reports back what the redirect carried, the agent calls `submit_authorization_result`:
+
+```json
+{
+  "session_id": "issuance_123",
+  "status": "ready_for_credential_request"
+}
+```
+
+From here the flow converges with the pre-authorized code grant below — `request_credential` works the same regardless of which grant got the session to `ready_for_credential_request`.
 
 Had the offer instead used the pre-authorized code grant, `initiate_issuance` would complete the token exchange in that same call and return `status: "ready_for_credential_request"` directly. The agent can then call `request_credential`:
 
@@ -679,7 +723,7 @@ Had the offer instead used the pre-authorized code grant, `initiate_issuance` wo
 }
 ```
 
-The issued credential itself never appears in this response — `request_credential` hands it to the `WalletAdapter` (`MockWalletAdapter` today), which is where it's held. This is the one path, end to end, that's fully wired up today: by-value or by-reference offer → issuer metadata → token exchange → wallet-generated proof → credential request → credential in the wallet's custody.
+The issued credential itself never appears in this response — `request_credential` hands it to the `WalletAdapter` (`MockWalletAdapter` today), which is where it's held. Both grants are fully wired up end to end today: by-value or by-reference offer → issuer metadata → (authorization code grant: browser authorization; pre-authorized code grant: immediate token exchange) → wallet-generated proof → credential request → credential in the wallet's custody.
 
 **Debug tool:** `debug_inspect_mock_wallet_credentials` (in [`src/mcp_oidc4vci/server.py`](../src/mcp_oidc4vci/server.py)) lists what the in-process `MockWalletAdapter` has received — the only way to inspect an issued credential without violating the "never returns to the agent" rule above, and only meaningful because today's wallet happens to be a mock. It's registered as an MCP tool only when the `MCP_OIDC4VCI_DEBUG_TOOLS` environment variable is set (`1`/`true`/`yes`); otherwise it isn't discoverable at all. It should be removed once a real (non-mock) wallet is wired in.
 
@@ -731,7 +775,7 @@ Raw credentials
 
 ### Token handling
 
-Access tokens, authorization codes, and pre-authorized codes are treated as sensitive values that never cross the MCP boundary. `initiate_issuance` performs the Token Request server-side and stores the resulting access token only inside the in-memory `IssuanceSession` record (`src/mcp_oidc4vci/issuance.py`) — `get_issuance_status` and `initiate_issuance`'s own return value expose only `session_id`, `status`, and (on failure) a short `error` string:
+Access tokens, authorization codes, pre-authorized codes, and — for the authorization code grant — the PKCE code verifier are all treated as sensitive values that never cross the MCP boundary. `initiate_issuance` (and, for the authorization code grant, `submit_authorization_result`) perform the Token Request server-side and store the resulting access token only inside the in-memory `IssuanceSession` record (`src/mcp_oidc4vci/issuance.py`) — `get_issuance_status`'s return value exposes only `session_id`, `status`, `authorization_url` (public by construction — it's the URL a human is meant to open), and (on failure) a short `error` string. The `code`/`state` a human copies from the browser redirect are consumed once by `submit_authorization_result` and never stored or echoed back beyond that single call:
 
 ```text
 Agent
