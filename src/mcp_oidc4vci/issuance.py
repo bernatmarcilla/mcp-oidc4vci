@@ -177,6 +177,15 @@ class IssuanceSession:
     `awaiting_deferred_credential` and these carry what `poll_deferred_credential` needs to
     check back later — `transaction_id` to identify the pending request, `deferred_interval`
     as the issuer's suggested wait (in seconds) before polling again.
+
+    `next_credential_index` is which entry of `credential_configuration_ids` the next
+    Credential Request is for — the spec's Credential Request only ever names one
+    `credential_configuration_id`, so an offer requesting several needs one Request per
+    configuration. `request_credential`/`submit_wallet_proof`/`poll_deferred_credential` each
+    handle exactly one and then, if more remain, return the session to
+    `ready_for_credential_request` rather than `completed` — the caller is meant to call the
+    same tool again for the next one, the same way `poll_deferred_credential` is meant to be
+    called again to check a pending one.
     """
 
     session_id: str
@@ -202,6 +211,7 @@ class IssuanceSession:
     authorization_url: str | None = None
     transaction_id: str | None = None
     deferred_interval: int | None = None
+    next_credential_index: int = 0
 
 
 class IssuanceSessionStore:
@@ -282,6 +292,7 @@ class IssuanceSessionStore:
         authorization_url: str | None = None,
         transaction_id: str | None = None,
         deferred_interval: int | None = None,
+        next_credential_index: int | None = None,
     ) -> IssuanceSession:
         async with self._lock:
             self._evict_expired_locked()
@@ -323,6 +334,8 @@ class IssuanceSessionStore:
                 session.transaction_id = transaction_id
             if deferred_interval is not None:
                 session.deferred_interval = deferred_interval
+            if next_credential_index is not None:
+                session.next_credential_index = next_credential_index
             return session
 
     async def get(self, session_id: str) -> IssuanceSession:

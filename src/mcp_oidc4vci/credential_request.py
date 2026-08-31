@@ -2,9 +2,14 @@
 "Deferred Credential Endpoint").
 
 Ties together Credential Issuer Metadata, the Nonce Endpoint, and a WalletAdapter to obtain
-one issued credential for a session that has already completed a Token Request. When the
-Credential Issuer defers issuance instead of returning credentials immediately,
-`poll_deferred_credential` checks back later using the same session.
+issued credentials for a session that has already completed a Token Request. The spec's
+Credential Request only ever names one `credential_configuration_id`, so an offer requesting
+several needs one Request per configuration — `request_credential`/`submit_wallet_proof`
+handle exactly one at a time and, when more remain, land back on
+`ready_for_credential_request` rather than `completed`, for the caller to call again for the
+next one. When the Credential Issuer defers issuance instead of returning credentials
+immediately, `poll_deferred_credential` checks back later using the same session, and follows
+the same "one at a time, call again for the next" rule once that one resolves.
 """
 
 import json
@@ -66,13 +71,16 @@ async def request_credential(
     fetch_nonce: NoncePoster | None = None,
     post_credential_request: CredentialRequester | None = None,
 ) -> IssuanceSession:
-    """Complete the Credential Request for a session that already has an access token,
+    """Complete a Credential Request for a session that already has an access token,
     automatically, using the configured `WalletAdapter` to produce the proof.
 
     Requests a fresh `c_nonce` when the issuer has a Nonce Endpoint, asks the wallet to
-    generate a proof of possession over it, sends the Credential Request, and hands each
-    issued credential to the wallet. The session ends `completed` or `failed` — or, if the
-    Credential Issuer defers issuance instead of responding immediately,
+    generate a proof of possession over it, sends the Credential Request, and hands the
+    issued credential to the wallet. If the offer requested more than one credential
+    configuration, this handles exactly one per call — the session lands back on
+    `ready_for_credential_request` if more remain, so call this again for the next one,
+    rather than `completed`. Otherwise ends `completed` or `failed` — or, if the Credential
+    Issuer defers issuance instead of responding immediately,
     `awaiting_deferred_credential`; call `poll_deferred_credential` to check back later. The
     credential's content is never returned to the caller either way.
 
@@ -144,7 +152,10 @@ async def submit_wallet_proof(
     outside this server, in response to `request_wallet_proof`.
 
     Still hands the issued credential to `wallet.receive_credential` — that part of the
-    boundary applies regardless of who signed the proof. Can also end
+    boundary applies regardless of who signed the proof. Handles exactly one credential
+    configuration per call, same as `request_credential`: if the offer requested more than
+    one, this returns the session to `ready_for_credential_request` (not `completed`) when
+    more remain, so `request_wallet_proof` can be called again for the next one. Can also end
     `awaiting_deferred_credential` instead of `completed`/`failed`, same as `request_credential`.
     """
     session = await sessions.get(session_id)
@@ -177,6 +188,10 @@ def _require_status(
         )
 
 
+def _current_credential_configuration_id(session: IssuanceSession) -> str:
+    return session.credential_configuration_ids[session.next_credential_index]
+
+
 async def _prepare_proof_request(
     session: IssuanceSession,
     *,
@@ -202,7 +217,7 @@ async def _send_credential_request(
     post_credential_request: CredentialRequester | None,
 ) -> IssuanceSession:
     assert session.access_token is not None
-    credential_configuration_id = session.credential_configuration_ids[0]
+    credential_configuration_id = _current_credential_configuration_id(session)
     body: dict[str, object] = {
         "credential_configuration_id": credential_configuration_id,
         "proofs": {"jwt": [proof]},
@@ -238,9 +253,12 @@ async def poll_deferred_credential(
     authenticated the same way as the original Credential Request (Bearer or DPoP, per
     whether the session's access token ended up DPoP-bound). The session stays
     `awaiting_deferred_credential` — with a possibly updated `deferred_interval` — if the
-    issuer still isn't ready, or moves to `completed`/`failed` once it is or the issuer gives
-    up on it. On success, each issued credential goes straight to the wallet, exactly like
-    `request_credential` — its content never reaches the caller either way.
+    issuer still isn't ready, or moves to `completed`/`ready_for_credential_request`/`failed`
+    once it is or the issuer gives up on it. On success, the issued credential goes straight to
+    the wallet, exactly like `request_credential` — its content never reaches the caller either
+    way. If the offer requested more than one credential configuration and others still remain
+    after this one resolves, the session lands on `ready_for_credential_request` instead of
+    `completed`, for `request_credential`/`request_wallet_proof` to pick up from there.
     """
     session = await sessions.get(session_id)
     _require_status(session, "awaiting_deferred_credential", need_access_token=True)
@@ -276,7 +294,7 @@ async def poll_deferred_credential(
         )
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
-    credential_configuration_id = session.credential_configuration_ids[0]
+    credential_configuration_id = _current_credential_configuration_id(session)
     return await _finalize_credential_response(
         response, session, credential_configuration_id, wallet, sessions
     )
@@ -291,8 +309,9 @@ async def _finalize_credential_response(
 ) -> IssuanceSession:
     if response.transaction_id is not None:
         logger.info(
-            "Session %s issuance deferred (interval=%s).",
+            "Session %s issuance deferred for %r (interval=%s).",
             session.session_id,
+            credential_configuration_id,
             response.interval,
         )
         return await sessions.update(
@@ -310,12 +329,31 @@ async def _finalize_credential_response(
         )
 
     logger.info(
-        "Session %s completed; %d credential(s) issued for %r.",
+        "Session %s issued %d credential(s) for %r.",
         session.session_id,
         len(response.credentials),
         credential_configuration_id,
     )
-    return await sessions.update(session.session_id, status="completed")
+
+    # The spec's Credential Request only ever names one credential_configuration_id, so an
+    # offer requesting several needs one Request per configuration — move on to the next one
+    # if there is one, rather than declaring the whole session done.
+    next_index = session.next_credential_index + 1
+    if next_index < len(session.credential_configuration_ids):
+        return await sessions.update(
+            session.session_id,
+            status="ready_for_credential_request",
+            next_credential_index=next_index,
+        )
+
+    logger.info(
+        "Session %s completed; all %d credential configuration(s) issued.",
+        session.session_id,
+        len(session.credential_configuration_ids),
+    )
+    return await sessions.update(
+        session.session_id, status="completed", next_credential_index=next_index
+    )
 
 
 def _parse_credential_response(status_code: int, body: str) -> CredentialResponse:

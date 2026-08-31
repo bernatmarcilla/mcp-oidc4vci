@@ -71,10 +71,11 @@ async def _ready_session(
     *,
     access_token: str = "secret-token",
     dpop_bound: bool = False,
+    credential_configuration_ids: list[str] | None = None,
 ) -> str:
     session = await sessions.create(
         credential_issuer=ISSUER,
-        credential_configuration_ids=["UniversityDegreeCredential"],
+        credential_configuration_ids=credential_configuration_ids or ["UniversityDegreeCredential"],
         flow_type=PRE_AUTHORIZED_CODE_GRANT_TYPE,
     )
     await sessions.update(
@@ -255,6 +256,177 @@ async def test_rejects_the_pre_final_singular_credential_shape() -> None:
     assert session.error is not None
     assert "['credential', 'notification_id']" in session.error
     assert wallet.received_credentials == []
+
+
+# -- multiple credential configurations ------------------------------------------
+
+
+async def test_request_credential_handles_one_configuration_per_call() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(
+        sessions, credential_configuration_ids=["UniversityDegreeCredential", "DriversLicense"]
+    )
+    wallet = MockWalletAdapter()
+    requested_configuration_ids: list[str] = []
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        requested_configuration_ids.append(str(body["credential_configuration_id"]))
+        return 200, {}, _SUCCESS_BODY
+
+    first = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert first.status == "ready_for_credential_request"
+    assert len(wallet.received_credentials) == 1
+    first_issued = wallet.received_credentials[0]
+    assert first_issued["credential_configuration_id"] == "UniversityDegreeCredential"
+
+    second = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert second.status == "completed"
+    assert len(wallet.received_credentials) == 2
+    assert wallet.received_credentials[1]["credential_configuration_id"] == "DriversLicense"
+    assert requested_configuration_ids == ["UniversityDegreeCredential", "DriversLicense"]
+
+
+async def test_submit_wallet_proof_handles_one_configuration_per_call() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(
+        sessions, credential_configuration_ids=["UniversityDegreeCredential", "DriversLicense"]
+    )
+    wallet = MockWalletAdapter()
+
+    proof_request_first = await request_wallet_proof(
+        session_id, sessions=sessions, fetch_issuer_metadata=_fetch_default_issuer_metadata
+    )
+    assert proof_request_first.status == "awaiting_wallet_proof"
+
+    first = await submit_wallet_proof(
+        session_id,
+        "externally-signed-jwt-1",
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=_success_post,
+    )
+    assert first.status == "ready_for_credential_request"
+    assert len(wallet.received_credentials) == 1
+
+    proof_request_second = await request_wallet_proof(
+        session_id, sessions=sessions, fetch_issuer_metadata=_fetch_default_issuer_metadata
+    )
+    assert proof_request_second.status == "awaiting_wallet_proof"
+
+    second = await submit_wallet_proof(
+        session_id,
+        "externally-signed-jwt-2",
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=_success_post,
+    )
+    assert second.status == "completed"
+    assert len(wallet.received_credentials) == 2
+    issued = [c["credential_configuration_id"] for c in wallet.received_credentials]
+    assert issued == ["UniversityDegreeCredential", "DriversLicense"]
+
+
+async def test_poll_deferred_credential_returns_to_ready_when_more_configurations_remain() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(
+        sessions, credential_configuration_ids=["UniversityDegreeCredential", "DriversLicense"]
+    )
+    wallet = MockWalletAdapter()
+
+    async def deferred_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 202, {}, '{"transaction_id": "8xLOxBtZp8", "interval": 5}'
+
+    deferred = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=deferred_post,
+    )
+    assert deferred.status == "awaiting_deferred_credential"
+
+    resolved = await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=_success_post,
+    )
+
+    assert resolved.status == "ready_for_credential_request"
+    assert len(wallet.received_credentials) == 1
+    first_issued = wallet.received_credentials[0]
+    assert first_issued["credential_configuration_id"] == "UniversityDegreeCredential"
+
+    final = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=_success_post,
+    )
+
+    assert final.status == "completed"
+    assert len(wallet.received_credentials) == 2
+    assert wallet.received_credentials[1]["credential_configuration_id"] == "DriversLicense"
+
+
+async def test_a_failure_on_the_second_configuration_fails_the_whole_session() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(
+        sessions, credential_configuration_ids=["UniversityDegreeCredential", "DriversLicense"]
+    )
+    wallet = MockWalletAdapter()
+    call_count = 0
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return 200, {}, _SUCCESS_BODY
+        return 400, {}, '{"error": "invalid_proof", "error_description": "proof nonce expired"}'
+
+    await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+    second = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert second.status == "failed"
+    assert second.error == "proof nonce expired"
+    # The first credential was already handed to the wallet before the second one failed.
+    assert len(wallet.received_credentials) == 1
 
 
 # -- failure paths ----------------------------------------------------------------

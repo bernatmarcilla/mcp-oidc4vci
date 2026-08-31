@@ -157,13 +157,16 @@ async def get_issuance_status(session_id: str) -> dict[str, Any]:
 
 @mcp.tool
 async def request_credential(session_id: str) -> dict[str, Any]:
-    """Complete the Credential Request for a session that has an access token.
+    """Complete a Credential Request for a session that has an access token.
 
     Generates a key proof of possession through the wallet adapter — this server never
     signs anything itself — and hands the issued credential to the wallet for safekeeping.
-    Its contents are never returned to the agent. If the Credential Issuer defers issuance
-    instead of responding immediately, the session ends `awaiting_deferred_credential`
-    instead of `completed`/`failed` — call poll_deferred_credential to check back later.
+    Its contents are never returned to the agent. If the Credential Offer requested more
+    than one credential configuration, this handles one per call — the session goes back to
+    `ready_for_credential_request` (not `completed`) while more remain, so call this again
+    for the next one. Otherwise ends `completed`/`failed`, or, if the Credential Issuer
+    defers issuance instead of responding immediately, `awaiting_deferred_credential` — call
+    poll_deferred_credential to check back later.
     """
     try:
         session = await fetch_credential(session_id, sessions=_sessions, wallet=_wallet)
@@ -182,7 +185,10 @@ async def poll_deferred_credential(session_id: str) -> dict[str, Any]:
     retry on its own, so call it again no sooner than that. Ends `completed` once the
     credential is ready (handed straight to the wallet, same as request_credential) or
     `failed` if the issuer gives up on the pending request; otherwise stays
-    `awaiting_deferred_credential`, possibly with an updated `deferred_interval`.
+    `awaiting_deferred_credential`, possibly with an updated `deferred_interval`. If the offer
+    requested more than one credential configuration and others still remain once this one
+    resolves, the session lands on `ready_for_credential_request` instead — call
+    request_credential or request_wallet_proof again for the next one.
     """
     try:
         session = await poll_deferred_credential_flow(
@@ -201,7 +207,10 @@ async def request_wallet_proof(session_id: str) -> dict[str, Any]:
     Use this instead of request_credential when the proof must be produced by something
     outside this server — a real wallet, or a human signing by hand. Returns the audience
     and (if the issuer requires one) nonce to sign; the session moves to
-    `awaiting_wallet_proof`. Call submit_wallet_proof with the result once you have it.
+    `awaiting_wallet_proof`. Call submit_wallet_proof with the result once you have it. If
+    the offer requested more than one credential configuration, call this again after each
+    submit_wallet_proof for as long as the session keeps landing back on
+    `ready_for_credential_request` instead of `completed`.
     """
     try:
         session = await begin_wallet_proof(session_id, sessions=_sessions)
@@ -216,7 +225,10 @@ async def submit_wallet_proof(session_id: str, proof_jwt: str) -> dict[str, Any]
     response to request_wallet_proof.
 
     Hands the issued credential to the wallet adapter for safekeeping, same as
-    request_credential — its contents are never returned to the agent.
+    request_credential — its contents are never returned to the agent. Handles one credential
+    configuration per call, same as request_credential: the session returns to
+    `ready_for_credential_request` (not `completed`) if the offer requested more than one and
+    others remain — call request_wallet_proof again for the next one.
     """
     try:
         session = await finish_wallet_proof(
@@ -260,7 +272,13 @@ def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
     if session.error is not None:
         output["error"] = session.error
     if session.status == "awaiting_wallet_proof":
-        proof_request: dict[str, Any] = {"audience": session.credential_issuer}
+        credential_configuration_id = session.credential_configuration_ids[
+            session.next_credential_index
+        ]
+        proof_request: dict[str, Any] = {
+            "audience": session.credential_issuer,
+            "credential_configuration_id": credential_configuration_id,
+        }
         if session.proof_nonce is not None:
             proof_request["nonce"] = session.proof_nonce
         output["proof_request"] = proof_request

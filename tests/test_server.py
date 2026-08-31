@@ -1,3 +1,4 @@
+import json
 from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
@@ -236,6 +237,67 @@ async def test_request_credential_completes_the_full_flow(monkeypatch: pytest.Mo
         "session_id": initiate_result.data["session_id"],
         "status": "completed",
     }
+
+
+async def test_request_credential_handles_multiple_configurations_across_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_configuration_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"},
+                        "DriversLicense": {"format": "vc+sd-jwt"},
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/credential":
+            body = json.loads(request.content)
+            requested_configuration_ids.append(body["credential_configuration_id"])
+            return httpx.Response(200, json={"credentials": [{"credential": "opaque-jwt-vc"}]})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential", "DriversLicense"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        session_id = initiate_result.data["session_id"]
+
+        first = await client.call_tool("request_credential", {"session_id": session_id})
+        assert first.data == {"session_id": session_id, "status": "ready_for_credential_request"}
+
+        second = await client.call_tool("request_credential", {"session_id": session_id})
+        assert second.data == {"session_id": session_id, "status": "completed"}
+
+    assert requested_configuration_ids == ["UniversityDegreeCredential", "DriversLicense"]
 
 
 async def test_poll_deferred_credential_completes_a_deferred_flow(
@@ -521,7 +583,11 @@ async def test_manual_wallet_proof_completes_the_full_flow(monkeypatch: pytest.M
         assert proof_result.data == {
             "session_id": session_id,
             "status": "awaiting_wallet_proof",
-            "proof_request": {"audience": "https://issuer.example.com", "nonce": "fresh-nonce"},
+            "proof_request": {
+                "audience": "https://issuer.example.com",
+                "credential_configuration_id": "UniversityDegreeCredential",
+                "nonce": "fresh-nonce",
+            },
         }
 
         submit_result = await client.call_tool(
