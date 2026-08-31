@@ -13,6 +13,9 @@ from mcp_oidc4vci.credential_issuer_metadata import (
     get_credential_issuer_metadata as fetch_credential_issuer_metadata,
 )
 from mcp_oidc4vci.credential_offer import InvalidCredentialOfferError, resolve_credential_offer
+from mcp_oidc4vci.credential_request import (
+    poll_deferred_credential as poll_deferred_credential_flow,
+)
 from mcp_oidc4vci.credential_request import request_credential as fetch_credential
 from mcp_oidc4vci.credential_request import request_wallet_proof as begin_wallet_proof
 from mcp_oidc4vci.credential_request import submit_wallet_proof as finish_wallet_proof
@@ -158,10 +161,33 @@ async def request_credential(session_id: str) -> dict[str, Any]:
 
     Generates a key proof of possession through the wallet adapter — this server never
     signs anything itself — and hands the issued credential to the wallet for safekeeping.
-    Its contents are never returned to the agent.
+    Its contents are never returned to the agent. If the Credential Issuer defers issuance
+    instead of responding immediately, the session ends `awaiting_deferred_credential`
+    instead of `completed`/`failed` — call poll_deferred_credential to check back later.
     """
     try:
         session = await fetch_credential(session_id, sessions=_sessions, wallet=_wallet)
+    except (IssuanceSessionNotFoundError, SessionNotReadyError) as exc:
+        raise ToolError(str(exc)) from exc
+    return _issuance_session_output(session)
+
+
+@mcp.tool
+async def poll_deferred_credential(session_id: str) -> dict[str, Any]:
+    """Check back on a session left `awaiting_deferred_credential` by request_credential or
+    submit_wallet_proof.
+
+    The session's status carries how long to wait: `deferred_interval`, in seconds, is the
+    Credential Issuer's own suggested wait before polling again — this tool doesn't wait or
+    retry on its own, so call it again no sooner than that. Ends `completed` once the
+    credential is ready (handed straight to the wallet, same as request_credential) or
+    `failed` if the issuer gives up on the pending request; otherwise stays
+    `awaiting_deferred_credential`, possibly with an updated `deferred_interval`.
+    """
+    try:
+        session = await poll_deferred_credential_flow(
+            session_id, sessions=_sessions, wallet=_wallet
+        )
     except (IssuanceSessionNotFoundError, SessionNotReadyError) as exc:
         raise ToolError(str(exc)) from exc
     return _issuance_session_output(session)
@@ -240,6 +266,8 @@ def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
         output["proof_request"] = proof_request
     if session.status == "awaiting_authorization_result" and session.authorization_url is not None:
         output["authorization_url"] = session.authorization_url
+    if session.status == "awaiting_deferred_credential" and session.deferred_interval is not None:
+        output["deferred_interval"] = session.deferred_interval
     return output
 
 

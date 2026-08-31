@@ -542,7 +542,8 @@ waiting_for_user_authorization    (authorization_code grant, AS metadata resolve
 awaiting_authorization_result     (begin_authorization called; awaiting submit_authorization_result)
 ready_for_credential_request      (either grant: token exchange succeeded)
 awaiting_wallet_proof             (request_wallet_proof called; awaiting submit_wallet_proof)
-completed                         (request_credential or submit_wallet_proof succeeded)
+awaiting_deferred_credential      (issuer deferred issuance; call poll_deferred_credential)
+completed                         (request_credential, submit_wallet_proof, or poll_deferred_credential succeeded)
 failed
 ```
 
@@ -591,11 +592,19 @@ or, on failure:
 - Ask the `WalletAdapter` to generate a key-proof JWT over `{audience: credential_issuer, nonce: c_nonce}` — this server never signs anything itself.
 - Send the Credential Request (`credential_configuration_id` + `proofs.jwt`) with the session's access token as a Bearer token.
 - Hand each issued credential to `wallet.receive_credential(...)`; the tool's own return value never includes the credential's contents.
-- On a rejected or malformed exchange, or a deferred response (`transaction_id` — not yet supported), mark the session `failed` with a short `error` message, mirroring how `initiate_issuance` handles Token Request failures.
+- On a rejected or malformed exchange, mark the session `failed` with a short `error` message, mirroring how `initiate_issuance` handles Token Request failures. On a deferred response (`transaction_id`, spec "Deferred Credential Response"), move the session to `awaiting_deferred_credential` instead — see `poll_deferred_credential` below.
 
 Implemented in [`src/mcp_oidc4vci/credential_request.py`](../src/mcp_oidc4vci/credential_request.py), which relies on [`src/mcp_oidc4vci/nonce.py`](../src/mcp_oidc4vci/nonce.py) and the `WalletAdapter` boundary in [`src/mcp_oidc4vci/wallet.py`](../src/mcp_oidc4vci/wallet.py).
 
 **Known simplification:** always requests exactly one credential, for the first ID in `credential_configuration_ids`, and always includes a `jwt` proof — the spec only requires `proofs` when the configuration declares `proof_types_supported`, but sending one unconditionally is harmless and keeps the logic simple.
+
+### `poll_deferred_credential`
+
+Checks back on a session left `awaiting_deferred_credential` by `request_credential` or `submit_wallet_proof` (spec "Deferred Credential Endpoint"). Fetches Credential Issuer Metadata fresh to find `deferred_credential_endpoint`, then POSTs `{"transaction_id": ...}` there — authenticated exactly like the original Credential Request (`_post_with_dpop` is reused unchanged: Bearer or DPoP, per whether the session ended up DPoP-bound), and parsed with the same `_parse_credential_response`, since the spec defines the Deferred Credential Response as reusing the Credential Response's shape (`credentials`/`transaction_id`/`interval`, just HTTP 202 instead of 200 for "still pending" instead of "ready"). No polling loop or automatic waiting happens inside this server — `deferred_interval` (the issuer's suggested wait, in seconds) is surfaced back to the caller, who's responsible for waiting and calling again.
+
+Ends `completed` (credential handed to the wallet, same as `request_credential`) once ready, `failed` on a rejected or malformed request, or stays `awaiting_deferred_credential` — possibly with an updated `deferred_interval` — if the issuer still isn't ready. If the issuer's metadata no longer advertises a `deferred_credential_endpoint` by the time this is called, that's reported as a failure rather than silently giving up.
+
+Implemented in [`src/mcp_oidc4vci/credential_request.py`](../src/mcp_oidc4vci/credential_request.py), sharing `_post_with_dpop` and `_parse_credential_response` with `request_credential`/`submit_wallet_proof`.
 
 **Strict v1.0 compliance:** `CredentialResponse` only recognizes the final spec's `credentials` array — a pre-final draft's singular `credential` field (still returned by at least one real issuer's dev/test environment encountered during development) is deliberately *not* accepted as an alias. A non-conformant response is reported clearly (`InvalidCredentialResponseError` naming the actual top-level fields received) rather than silently worked around. Also supports DPoP-bound access tokens end to end (RFC 9449; see [`src/mcp_oidc4vci/dpop.py`](../src/mcp_oidc4vci/dpop.py)) — required by that same environment's Authorization Server.
 

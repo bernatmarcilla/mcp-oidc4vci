@@ -1,7 +1,10 @@
-"""Credential Request orchestration (spec "Credential Endpoint" / "Credential Request").
+"""Credential Request orchestration (spec "Credential Endpoint" / "Credential Request",
+"Deferred Credential Endpoint").
 
 Ties together Credential Issuer Metadata, the Nonce Endpoint, and a WalletAdapter to obtain
-one issued credential for a session that has already completed a Token Request.
+one issued credential for a session that has already completed a Token Request. When the
+Credential Issuer defers issuance instead of returning credentials immediately,
+`poll_deferred_credential` checks back later using the same session.
 """
 
 import json
@@ -68,8 +71,10 @@ async def request_credential(
 
     Requests a fresh `c_nonce` when the issuer has a Nonce Endpoint, asks the wallet to
     generate a proof of possession over it, sends the Credential Request, and hands each
-    issued credential to the wallet. The session ends `completed` or `failed` — the
-    credential's content is never returned to the caller.
+    issued credential to the wallet. The session ends `completed` or `failed` — or, if the
+    Credential Issuer defers issuance instead of responding immediately,
+    `awaiting_deferred_credential`; call `poll_deferred_credential` to check back later. The
+    credential's content is never returned to the caller either way.
 
     Use `request_wallet_proof` / `submit_wallet_proof` instead when the proof must be
     produced by something outside this process (e.g. a real wallet) rather than
@@ -139,7 +144,8 @@ async def submit_wallet_proof(
     outside this server, in response to `request_wallet_proof`.
 
     Still hands the issued credential to `wallet.receive_credential` — that part of the
-    boundary applies regardless of who signed the proof.
+    boundary applies regardless of who signed the proof. Can also end
+    `awaiting_deferred_credential` instead of `completed`/`failed`, same as `request_credential`.
     """
     session = await sessions.get(session_id)
     _require_status(session, "awaiting_wallet_proof")
@@ -211,11 +217,89 @@ async def _send_credential_request(
         logger.warning("Session %s failed during credential request: %s", session.session_id, exc)
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
+    return await _finalize_credential_response(
+        response, session, credential_configuration_id, wallet, sessions
+    )
+
+
+async def poll_deferred_credential(
+    session_id: str,
+    *,
+    sessions: IssuanceSessionStore,
+    wallet: WalletAdapter,
+    fetch_issuer_metadata: MetadataFetcher | None = None,
+    post_credential_request: CredentialRequester | None = None,
+) -> IssuanceSession:
+    """Poll the Deferred Credential Endpoint (spec "Deferred Credential Endpoint") for a
+    session left `awaiting_deferred_credential` by `request_credential` or
+    `submit_wallet_proof`.
+
+    Sends the session's stored `transaction_id` back to the Deferred Credential Endpoint,
+    authenticated the same way as the original Credential Request (Bearer or DPoP, per
+    whether the session's access token ended up DPoP-bound). The session stays
+    `awaiting_deferred_credential` — with a possibly updated `deferred_interval` — if the
+    issuer still isn't ready, or moves to `completed`/`failed` once it is or the issuer gives
+    up on it. On success, each issued credential goes straight to the wallet, exactly like
+    `request_credential` — its content never reaches the caller either way.
+    """
+    session = await sessions.get(session_id)
+    _require_status(session, "awaiting_deferred_credential", need_access_token=True)
+    assert session.transaction_id is not None
+
+    try:
+        issuer_metadata = await get_credential_issuer_metadata(
+            session.credential_issuer, fetch=fetch_issuer_metadata
+        )
+    except InvalidCredentialIssuerMetadataError as exc:
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    if issuer_metadata.deferred_credential_endpoint is None:
+        error = (
+            f"Credential Issuer {session.credential_issuer!r} no longer advertises a "
+            "deferred_credential_endpoint; the pending transaction cannot be polled."
+        )
+        return await sessions.update(session.session_id, status="failed", error=error)
+
+    body: dict[str, object] = {"transaction_id": session.transaction_id}
+
+    try:
+        status_code, response_body = await _post_with_dpop(
+            post_credential_request or _post_credential_request,
+            issuer_metadata.deferred_credential_endpoint,
+            body,
+            session,
+        )
+        response = _parse_credential_response(status_code, response_body)
+    except (CredentialRequestRejectedError, InvalidCredentialResponseError) as exc:
+        logger.warning(
+            "Session %s failed polling the deferred credential: %s", session.session_id, exc
+        )
+        return await sessions.update(session.session_id, status="failed", error=str(exc))
+
+    credential_configuration_id = session.credential_configuration_ids[0]
+    return await _finalize_credential_response(
+        response, session, credential_configuration_id, wallet, sessions
+    )
+
+
+async def _finalize_credential_response(
+    response: CredentialResponse,
+    session: IssuanceSession,
+    credential_configuration_id: str,
+    wallet: WalletAdapter,
+    sessions: IssuanceSessionStore,
+) -> IssuanceSession:
     if response.transaction_id is not None:
+        logger.info(
+            "Session %s issuance deferred (interval=%s).",
+            session.session_id,
+            response.interval,
+        )
         return await sessions.update(
             session.session_id,
-            status="failed",
-            error="Credential issuance was deferred; deferred issuance is not yet supported.",
+            status="awaiting_deferred_credential",
+            transaction_id=response.transaction_id,
+            deferred_interval=response.interval,
         )
 
     # _parse_credential_response guarantees credentials is set whenever transaction_id isn't.

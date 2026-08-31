@@ -155,7 +155,7 @@ class IssuanceSession:
     Authorization Server advertises support) and whether the resulting access token ended
     up DPoP-bound, so a later `request_credential` call can present it the same way.
 
-    The remaining fields exist only for the `authorization_code` grant, which — unlike the
+    The following fields exist only for the `authorization_code` grant, which — unlike the
     pre-authorized code grant — spans three separate tool calls (`initiate_issuance` ->
     `begin_authorization` -> `submit_authorization_result`) and so needs somewhere to keep
     state between them: `authorization_endpoint`/`token_endpoint`/`issuer_state` are resolved
@@ -171,6 +171,12 @@ class IssuanceSession:
     `submit_authorization_result` receives back, to guard against cross-session mixups;
     `authorization_url` is surfaced to the caller while `status == "awaiting_authorization_result"`,
     the same way `proof_nonce` is surfaced for `awaiting_wallet_proof`.
+
+    `transaction_id` and `deferred_interval` apply to either grant: when the Credential Issuer
+    defers issuance (spec "Deferred Credential Response"), `status` becomes
+    `awaiting_deferred_credential` and these carry what `poll_deferred_credential` needs to
+    check back later — `transaction_id` to identify the pending request, `deferred_interval`
+    as the issuer's suggested wait (in seconds) before polling again.
     """
 
     session_id: str
@@ -194,6 +200,8 @@ class IssuanceSession:
     code_verifier: str | None = None
     authorization_state: str | None = None
     authorization_url: str | None = None
+    transaction_id: str | None = None
+    deferred_interval: int | None = None
 
 
 class IssuanceSessionStore:
@@ -272,6 +280,8 @@ class IssuanceSessionStore:
         code_verifier: str | None = None,
         authorization_state: str | None = None,
         authorization_url: str | None = None,
+        transaction_id: str | None = None,
+        deferred_interval: int | None = None,
     ) -> IssuanceSession:
         async with self._lock:
             self._evict_expired_locked()
@@ -309,6 +319,10 @@ class IssuanceSessionStore:
                 session.authorization_state = authorization_state
             if authorization_url is not None:
                 session.authorization_url = authorization_url
+            if transaction_id is not None:
+                session.transaction_id = transaction_id
+            if deferred_interval is not None:
+                session.deferred_interval = deferred_interval
             return session
 
     async def get(self, session_id: str) -> IssuanceSession:

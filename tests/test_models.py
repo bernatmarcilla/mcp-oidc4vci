@@ -139,6 +139,31 @@ def test_credential_issuer_metadata_keys_configurations_by_id() -> None:
     )
 
 
+def test_credential_issuer_metadata_deferred_credential_endpoint_defaults_to_absent() -> None:
+    metadata = CredentialIssuerMetadata.model_validate(
+        {
+            "credential_issuer": "https://issuer.example.com",
+            "credential_endpoint": "https://issuer.example.com/credential",
+            "credential_configurations_supported": {},
+        }
+    )
+
+    assert metadata.deferred_credential_endpoint is None
+
+
+def test_credential_issuer_metadata_parses_deferred_credential_endpoint() -> None:
+    metadata = CredentialIssuerMetadata.model_validate(
+        {
+            "credential_issuer": "https://issuer.example.com",
+            "credential_endpoint": "https://issuer.example.com/credential",
+            "deferred_credential_endpoint": "https://issuer.example.com/deferred",
+            "credential_configurations_supported": {},
+        }
+    )
+
+    assert metadata.deferred_credential_endpoint == "https://issuer.example.com/deferred"
+
+
 def test_authorization_server_metadata_requires_issuer_and_token_endpoint() -> None:
     with pytest.raises(ValidationError):
         AuthorizationServerMetadata.model_validate({"issuer": "https://as.example.com"})

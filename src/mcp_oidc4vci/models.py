@@ -92,6 +92,9 @@ class CredentialIssuerMetadata(BaseModel):
     credential_endpoint: str
     authorization_servers: list[str] | None = None
     nonce_endpoint: str | None = None
+    # spec "Deferred Credential Endpoint" (§9). Presence is what a session that received a
+    # transaction_id needs to poll for the credential later.
+    deferred_credential_endpoint: str | None = None
     credential_configurations_supported: dict[str, CredentialConfiguration]
 
 

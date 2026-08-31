@@ -6,6 +6,7 @@ from mcp_oidc4vci import credential_request
 from mcp_oidc4vci.credential_request import (
     CredentialRequestRejectedError,
     SessionNotReadyError,
+    poll_deferred_credential,
     request_credential,
     request_wallet_proof,
     submit_wallet_proof,
@@ -24,11 +25,18 @@ ISSUER = "https://issuer.example.com"
 _SUCCESS_BODY = '{"credentials": [{"credential": "opaque-jwt-vc"}]}'
 
 
-def _issuer_metadata_json(*, nonce_endpoint: str | None = None) -> str:
+def _issuer_metadata_json(
+    *, nonce_endpoint: str | None = None, deferred_credential_endpoint: str | None = None
+) -> str:
     nonce_field = f', "nonce_endpoint": "{nonce_endpoint}"' if nonce_endpoint else ""
+    deferred_field = (
+        f', "deferred_credential_endpoint": "{deferred_credential_endpoint}"'
+        if deferred_credential_endpoint
+        else ""
+    )
     return (
         f'{{"credential_issuer": "{ISSUER}", '
-        f'"credential_endpoint": "{ISSUER}/credential"{nonce_field}, '
+        f'"credential_endpoint": "{ISSUER}/credential"{nonce_field}{deferred_field}, '
         '"credential_configurations_supported": '
         '{"UniversityDegreeCredential": {"format": "vc+sd-jwt"}}}'
     )
@@ -36,6 +44,10 @@ def _issuer_metadata_json(*, nonce_endpoint: str | None = None) -> str:
 
 async def _fetch_default_issuer_metadata(url: str) -> str:
     return _issuer_metadata_json()
+
+
+async def _fetch_issuer_metadata_with_deferred_endpoint(url: str) -> str:
+    return _issuer_metadata_json(deferred_credential_endpoint=f"{ISSUER}/deferred")
 
 
 async def _fail_if_nonce_posted(url: str) -> tuple[int, str]:
@@ -312,7 +324,7 @@ async def test_fails_the_session_when_the_credential_request_is_rejected() -> No
     assert session.error == "proof nonce expired"
 
 
-async def test_fails_the_session_for_a_deferred_response_without_calling_the_wallet() -> None:
+async def test_defers_the_session_on_a_deferred_response_without_calling_the_wallet() -> None:
     sessions = IssuanceSessionStore()
     session_id = await _ready_session(sessions)
     wallet = MockWalletAdapter()
@@ -330,9 +342,9 @@ async def test_fails_the_session_for_a_deferred_response_without_calling_the_wal
         post_credential_request=deferred_post,
     )
 
-    assert session.status == "failed"
-    assert session.error is not None
-    assert "deferred" in session.error.lower()
+    assert session.status == "awaiting_deferred_credential"
+    assert session.transaction_id == "8xLOxBtZp8"
+    assert session.deferred_interval == 5
     assert wallet.received_credentials == []
 
 
@@ -590,6 +602,209 @@ async def test_does_not_treat_a_plain_401_as_a_nonce_challenge() -> None:
     assert call_count == 1
     assert session.status == "failed"
     assert session.error == "token expired"
+
+
+# -- poll_deferred_credential ---------------------------------------------------
+
+
+async def _awaiting_deferred_credential_session(
+    sessions: IssuanceSessionStore, *, dpop_bound: bool = False
+) -> str:
+    session_id = await _ready_session(sessions, dpop_bound=dpop_bound)
+
+    async def deferred_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 202, {}, '{"transaction_id": "8xLOxBtZp8", "interval": 5}'
+
+    await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=deferred_post,
+    )
+    return session_id
+
+
+async def test_poll_deferred_credential_completes_when_the_credential_is_ready() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+    wallet = MockWalletAdapter()
+
+    session = await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=_success_post,
+    )
+
+    assert session.status == "completed"
+    assert wallet.received_credentials == [
+        {"credential_configuration_id": "UniversityDegreeCredential", "credential": "opaque-jwt-vc"}
+    ]
+
+
+async def test_poll_deferred_credential_posts_to_the_deferred_credential_endpoint() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+    requested_urls: list[str] = []
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        requested_urls.append(url)
+        return 200, {}, _SUCCESS_BODY
+
+    await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=fake_post,
+    )
+
+    assert requested_urls == [f"{ISSUER}/deferred"]
+
+
+async def test_poll_deferred_credential_sends_the_stored_transaction_id() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+    captured: dict[str, object] = {}
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured.update(body)
+        return 200, {}, _SUCCESS_BODY
+
+    await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=fake_post,
+    )
+
+    assert captured == {"transaction_id": "8xLOxBtZp8"}
+
+
+async def test_poll_deferred_credential_stays_pending_when_the_issuer_is_still_not_ready() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+
+    async def still_pending_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 202, {}, '{"transaction_id": "8xLOxBtZp8", "interval": 30}'
+
+    session = await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=still_pending_post,
+    )
+
+    assert session.status == "awaiting_deferred_credential"
+    assert session.transaction_id == "8xLOxBtZp8"
+    assert session.deferred_interval == 30
+
+
+async def test_poll_deferred_credential_fails_when_the_request_is_rejected() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+
+    async def rejecting_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return 400, {}, '{"error": "invalid_transaction_id"}'
+
+    session = await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=rejecting_post,
+    )
+
+    assert session.status == "failed"
+    assert session.error == "invalid_transaction_id"
+
+
+async def test_poll_deferred_credential_fails_when_issuer_metadata_is_invalid() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+
+    async def broken_issuer_metadata(url: str) -> str:
+        return "not-json"
+
+    session = await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=broken_issuer_metadata,
+        post_credential_request=_fail_if_credential_posted,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+
+
+async def test_poll_deferred_credential_fails_when_no_deferred_endpoint_is_advertised() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+
+    session = await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=_fail_if_credential_posted,
+    )
+
+    assert session.status == "failed"
+    assert session.error is not None
+    assert "deferred_credential_endpoint" in session.error
+
+
+async def test_poll_deferred_credential_raises_for_an_unknown_session() -> None:
+    with pytest.raises(IssuanceSessionNotFoundError):
+        await poll_deferred_credential(
+            "does-not-exist", sessions=IssuanceSessionStore(), wallet=MockWalletAdapter()
+        )
+
+
+async def test_poll_deferred_credential_raises_when_the_session_is_not_awaiting_one() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+
+    with pytest.raises(SessionNotReadyError):
+        await poll_deferred_credential(session_id, sessions=sessions, wallet=MockWalletAdapter())
+
+
+async def test_poll_deferred_credential_attaches_dpop_when_the_session_is_dpop_bound() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions, dpop_bound=True)
+    captured_headers: list[dict[str, str]] = []
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        captured_headers.append(headers)
+        return 200, {}, _SUCCESS_BODY
+
+    await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=fake_post,
+    )
+
+    assert "DPoP" in captured_headers[0]
+    assert captured_headers[0]["Authorization"].startswith("DPoP ")
 
 
 # -- request_wallet_proof / submit_wallet_proof: the manual two-step path -----
