@@ -63,7 +63,7 @@ Full details, component responsibilities, data flows, tool contracts, and securi
 | `attestation` Proof Type / key attestation | Not yet |
 | Deferred Credential Issuance | Supported |
 | Multiple credential configurations per offer | Supported — one Credential Request per configuration, one per tool call |
-| Signed (JWT) Credential Issuer Metadata | Not verified — plain JSON is requested and used instead |
+| Signed (JWT) Credential Issuer Metadata | Supported — signature verified against the `x5c` leaf certificate; no certificate chain-of-trust validation |
 | Credential Request/Response Encryption | Not yet |
 | Batch Credential Issuance | Not yet |
 | Notification Endpoint | Not yet — `notification_id` is parsed but not acted on |
@@ -78,7 +78,7 @@ This project is under active development. Here's what's implemented today.
 
 **Credential Offer inspection.** `inspect_credential_offer` resolves a Credential Offer by value or by reference (`credential_offer_uri`), validates it against OIDC4VCI 1.0, and returns the issuer, requested credential configuration IDs, and grants. See [src/mcp_oidc4vci/credential_offer.py](src/mcp_oidc4vci/credential_offer.py).
 
-**Credential Issuer metadata discovery.** `get_credential_issuer_metadata` fetches and validates a Credential Issuer's metadata from its well-known endpoint (correctly inserting the well-known path segment ahead of any path component in the issuer identifier, per spec), verifies the returned `credential_issuer` matches what was requested, and returns the credential endpoint, authorization servers, and supported credential configurations. See [src/mcp_oidc4vci/credential_issuer_metadata.py](src/mcp_oidc4vci/credential_issuer_metadata.py).
+**Credential Issuer metadata discovery.** `get_credential_issuer_metadata` fetches and validates a Credential Issuer's metadata from its well-known endpoint (correctly inserting the well-known path segment ahead of any path component in the issuer identifier, per spec), verifies the returned `credential_issuer` matches what was requested, and returns the credential endpoint, authorization servers, and supported credential configurations. It transparently handles either the unsigned JSON or the signed-JWT metadata representation (RFC 7515), verifying the JWS signature against the `x5c` certificate conveyed in the JOSE header — see [Architecture](docs/ARCHITECTURE.md#get_credential_issuer_metadata) for exactly what "verified" does and doesn't mean here (no certificate chain-of-trust validation is performed). See [src/mcp_oidc4vci/credential_issuer_metadata.py](src/mcp_oidc4vci/credential_issuer_metadata.py).
 
 **Issuance flow orchestration.** `describe_issuance_flow`, `initiate_issuance`, and `get_issuance_status` run on top of an in-memory `IssuanceSessionStore`. For the pre-authorized code grant, `initiate_issuance` completes the full Token Request end to end — OAuth Authorization Server discovery via RFC 8414, then the token exchange, including a [DPoP](https://www.rfc-editor.org/rfc/rfc9449) proof of possession when the Authorization Server requires one. For the authorization code grant, it resolves the Authorization Server's metadata and leaves the session ready for `begin_authorization`. See [src/mcp_oidc4vci/issuance.py](src/mcp_oidc4vci/issuance.py), [src/mcp_oidc4vci/authorization_server_metadata.py](src/mcp_oidc4vci/authorization_server_metadata.py), [src/mcp_oidc4vci/token_request.py](src/mcp_oidc4vci/token_request.py), and [src/mcp_oidc4vci/dpop.py](src/mcp_oidc4vci/dpop.py).
 
@@ -88,7 +88,7 @@ This project is under active development. Here's what's implemented today.
 
 **Manual wallet handoff.** `request_wallet_proof` / `submit_wallet_proof` split the Credential Request into two tool calls for when the proof must come from something other than the in-process `MockWalletAdapter` — a real wallet, or a human signing by hand — without needing any blocking-wait or webhook machinery: the handoff happens through the session, the same way `initiate_issuance` → `get_issuance_status` already does. `request_credential` (the automatic path) is unchanged and still there for fast, fully-automated testing. See [Architecture](docs/ARCHITECTURE.md#request_wallet_proof-and-submit_wallet_proof) for the design reasoning.
 
-Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 262 tests).
+Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 273 tests).
 
 ---
 
