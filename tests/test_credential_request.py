@@ -231,6 +231,47 @@ async def test_hands_each_issued_credential_to_the_wallet() -> None:
     ]
 
 
+async def test_stores_the_notification_id_from_a_successful_credential_response() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+    wallet = MockWalletAdapter()
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return (
+            200,
+            {},
+            '{"credentials": [{"credential": "opaque-jwt-vc"}], "notification_id": "3fwe98js"}',
+        )
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=wallet,
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=fake_post,
+    )
+
+    assert session.status == "completed"
+    assert session.notification_id == "3fwe98js"
+
+
+async def test_leaves_notification_id_unset_when_the_response_does_not_carry_one() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _ready_session(sessions)
+
+    session = await request_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_default_issuer_metadata,
+        post_credential_request=_success_post,
+    )
+
+    assert session.notification_id is None
+
+
 async def test_rejects_the_pre_final_singular_credential_shape() -> None:
     # This project targets v1.0 strictly (see docs/ARCHITECTURE.md). At least one real
     # issuer's dev/test environment still returns this pre-final draft shape instead of the
@@ -816,6 +857,31 @@ async def test_poll_deferred_credential_completes_when_the_credential_is_ready()
     assert wallet.received_credentials == [
         {"credential_configuration_id": "UniversityDegreeCredential", "credential": "opaque-jwt-vc"}
     ]
+
+
+async def test_poll_deferred_credential_stores_the_notification_id_on_completion() -> None:
+    sessions = IssuanceSessionStore()
+    session_id = await _awaiting_deferred_credential_session(sessions)
+
+    async def fake_post(
+        url: str, body: dict[str, object], headers: dict[str, str]
+    ) -> tuple[int, dict[str, str], str]:
+        return (
+            200,
+            {},
+            '{"credentials": [{"credential": "opaque-jwt-vc"}], "notification_id": "zp8xLOx"}',
+        )
+
+    session = await poll_deferred_credential(
+        session_id,
+        sessions=sessions,
+        wallet=MockWalletAdapter(),
+        fetch_issuer_metadata=_fetch_issuer_metadata_with_deferred_endpoint,
+        post_credential_request=fake_post,
+    )
+
+    assert session.status == "completed"
+    assert session.notification_id == "zp8xLOx"
 
 
 async def test_poll_deferred_credential_posts_to_the_deferred_credential_endpoint() -> None:

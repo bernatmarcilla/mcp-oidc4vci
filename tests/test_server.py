@@ -387,6 +387,258 @@ async def test_poll_deferred_credential_surfaces_an_unknown_session_as_a_tool_er
             await client.call_tool("poll_deferred_credential", {"session_id": "does-not-exist"})
 
 
+async def test_send_credential_notification_completes_the_full_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notifications: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "notification_endpoint": "https://issuer.example.com/notification",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/credential":
+            return httpx.Response(
+                200,
+                json={
+                    "credentials": [{"credential": "opaque-jwt-vc"}],
+                    "notification_id": "3fwe98js",
+                },
+            )
+        if request.method == "POST" and path == "/notification":
+            notifications.append(json.loads(request.content))
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        session_id = initiate_result.data["session_id"]
+
+        request_result = await client.call_tool("request_credential", {"session_id": session_id})
+        assert request_result.data == {
+            "session_id": session_id,
+            "status": "completed",
+            "notification_id": "3fwe98js",
+        }
+
+        notify_result = await client.call_tool(
+            "send_credential_notification",
+            {"session_id": session_id, "event": "credential_accepted"},
+        )
+
+    assert notify_result.data == {
+        "session_id": session_id,
+        "status": "completed",
+        "notification_id": "3fwe98js",
+    }
+    assert notifications == [{"notification_id": "3fwe98js", "event": "credential_accepted"}]
+
+
+async def test_send_credential_notification_surfaces_an_unknown_session_as_a_tool_error() -> None:
+    async with Client(mcp) as client:
+        with pytest.raises(ToolError, match="No issuance session"):
+            await client.call_tool(
+                "send_credential_notification",
+                {"session_id": "does-not-exist", "event": "credential_accepted"},
+            )
+
+
+async def test_send_credential_notification_surfaces_no_pending_notification_as_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        return httpx.Response(200, json={"access_token": "secret-token", "token_type": "Bearer"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        assert initiate_result.data["status"] == "ready_for_credential_request"
+
+        with pytest.raises(ToolError, match="no pending notification_id"):
+            await client.call_tool(
+                "send_credential_notification",
+                {
+                    "session_id": initiate_result.data["session_id"],
+                    "event": "credential_accepted",
+                },
+            )
+
+
+async def test_send_credential_notification_surfaces_no_notification_endpoint_as_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/credential":
+            return httpx.Response(
+                200,
+                json={
+                    "credentials": [{"credential": "opaque-jwt-vc"}],
+                    "notification_id": "3fwe98js",
+                },
+            )
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        session_id = initiate_result.data["session_id"]
+        await client.call_tool("request_credential", {"session_id": session_id})
+
+        with pytest.raises(ToolError, match="does not advertise a notification_endpoint"):
+            await client.call_tool(
+                "send_credential_notification",
+                {"session_id": session_id, "event": "credential_accepted"},
+            )
+
+
+async def test_send_credential_notification_surfaces_a_rejection_as_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and "oauth-authorization-server" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": "https://issuer.example.com/token",
+                },
+            )
+        if request.method == "GET" and "openid-credential-issuer" in path:
+            return httpx.Response(
+                200,
+                json={
+                    "credential_issuer": "https://issuer.example.com",
+                    "credential_endpoint": "https://issuer.example.com/credential",
+                    "notification_endpoint": "https://issuer.example.com/notification",
+                    "credential_configurations_supported": {
+                        "UniversityDegreeCredential": {"format": "vc+sd-jwt"}
+                    },
+                },
+            )
+        if request.method == "POST" and path == "/token":
+            return httpx.Response(
+                200, json={"access_token": "secret-token", "token_type": "Bearer"}
+            )
+        if request.method == "POST" and path == "/credential":
+            return httpx.Response(
+                200,
+                json={
+                    "credentials": [{"credential": "opaque-jwt-vc"}],
+                    "notification_id": "3fwe98js",
+                },
+            )
+        if request.method == "POST" and path == "/notification":
+            return httpx.Response(400, json={"error": "invalid_notification_id"})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_async_client(handler))
+
+    payload = (
+        '{"credential_issuer": "https://issuer.example.com", '
+        '"credential_configuration_ids": ["UniversityDegreeCredential"], '
+        '"grants": {"urn:ietf:params:oauth:grant-type:pre-authorized_code": '
+        '{"pre-authorized_code": "oaKazRN8I0IbtZ0C7JuMn5"}}}'
+    )
+
+    async with Client(mcp) as client:
+        initiate_result = await client.call_tool(
+            "initiate_issuance", {"credential_offer": _offer_uri(payload)}
+        )
+        session_id = initiate_result.data["session_id"]
+        await client.call_tool("request_credential", {"session_id": session_id})
+
+        with pytest.raises(ToolError, match="invalid_notification_id"):
+            await client.call_tool(
+                "send_credential_notification",
+                {"session_id": session_id, "event": "credential_accepted"},
+            )
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(None, False), ("", False), ("0", False), ("false", False), ("1", True), ("True", True)],

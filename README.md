@@ -66,7 +66,7 @@ Full details, component responsibilities, data flows, tool contracts, and securi
 | Signed (JWT) Credential Issuer Metadata | Supported — signature verified against the `x5c` leaf certificate; no certificate chain-of-trust validation |
 | Credential Request/Response Encryption | Not yet |
 | Batch Credential Issuance | Not yet |
-| Notification Endpoint | Not yet — `notification_id` is parsed but not acted on |
+| Notification Endpoint | Supported — one scalar `notification_id` per session; a multi-configuration session can only act on the most recently issued configuration's |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design reasoning behind each of these.
 
@@ -88,7 +88,9 @@ This project is under active development. Here's what's implemented today.
 
 **Manual wallet handoff.** `request_wallet_proof` / `submit_wallet_proof` split the Credential Request into two tool calls for when the proof must come from something other than the in-process `MockWalletAdapter` — a real wallet, or a human signing by hand — without needing any blocking-wait or webhook machinery: the handoff happens through the session, the same way `initiate_issuance` → `get_issuance_status` already does. `request_credential` (the automatic path) is unchanged and still there for fast, fully-automated testing. See [Architecture](docs/ARCHITECTURE.md#request_wallet_proof-and-submit_wallet_proof) for the design reasoning.
 
-Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 273 tests).
+**Notification Endpoint.** `send_credential_notification` reports a previously issued credential's outcome (`credential_accepted`, `credential_failure`, or `credential_deleted`) back to the Credential Issuer, using the `notification_id` a prior Credential Response or Deferred Credential Response carried — authenticated with the same Bearer/DPoP access token, never a new Token Request. Both sending a notification (the Wallet's side) and the issuer supporting this endpoint at all are optional per spec, so "nothing to notify about yet" and "this issuer doesn't support notifications" are reported as clear errors rather than silently ignored — but neither one, nor a rejected notification, ever fails the session: this is a side-channel courtesy to the issuer, not a step in the issuance flow. See [Architecture](docs/ARCHITECTURE.md#send_credential_notification) for the scalar `notification_id` scope limit on multi-configuration sessions. See [src/mcp_oidc4vci/notification.py](src/mcp_oidc4vci/notification.py) and [src/mcp_oidc4vci/session_request.py](src/mcp_oidc4vci/session_request.py) (the Bearer/DPoP-with-nonce-retry POST helper shared with `request_credential`).
+
+Shared data models live in [src/mcp_oidc4vci/models.py](src/mcp_oidc4vci/models.py), with tests in [tests/](tests/) (99% coverage, 305 tests).
 
 ---
 
@@ -139,3 +141,4 @@ This server has no HTTP endpoint of its own to receive a browser redirect (see [
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — components, design principles, wallet boundary, data flow, MCP tool contracts, security requirements.
+- [Roadmap](docs/ROADMAP.md) — delivery phases, MVP scope, and what's explicitly out of scope.

@@ -660,6 +660,39 @@ Both are implemented in [`src/mcp_oidc4vci/credential_request.py`](../src/mcp_oi
 
 **Why not a blocking wait with a webhook callback instead?** That's the more capable design — an MCP tool call blocks server-side on an `asyncio.Future`, resolved either by an HTTP callback a real wallet-side service POSTs to, or a concurrent poll, whichever comes first. It's a real, working pattern (a pending-call registry keyed by request ID, resolved by whichever of the callback or the poll arrives first), and it's the right shape once there's an actual external wallet/gateway on the other end capable of calling back. It's deliberately not what's built here yet: without a real wallet counterpart to call back, that machinery would have nothing to resolve it. The two-tool-call version above needs no new infrastructure and is the natural stepping stone — swapping in a real wallet later means adding a QR/deep-link step in front of `request_wallet_proof`, not rebuilding the waiting logic.
 
+### `send_credential_notification`
+
+Reports an issuance outcome back to the Credential Issuer for a session's most recently issued credential (spec "Notification Endpoint", §11). The Wallet is meant to use the `notification_id` a Credential Response or Deferred Credential Response carried (§8.3/§9.2) to tell the issuer whether the credential was actually accepted, failed to be stored, or was deleted — support for this endpoint is OPTIONAL on both sides: the issuer may not advertise it, and the Wallet is never required to send a notification at all.
+
+**Input**
+
+```json
+{
+  "session_id": "9f1c2e40-...-b2a6",
+  "event": "credential_accepted",
+  "event_description": "optional human-readable note for the issuer's developers"
+}
+```
+
+`event` must be exactly `credential_accepted`, `credential_failure`, or `credential_deleted` (spec §11.1); `event_description`, if given, is validated client-side against the spec's restricted ASCII charset (`%x20-21 / %x23-5B / %x5D-7E`) before anything is sent.
+
+**Output**
+
+```json
+{
+  "session_id": "9f1c2e40-...-b2a6",
+  "status": "completed"
+}
+```
+
+**Does not mutate session state.** Unlike every other tool in this server, `send_credential_notification` never calls `IssuanceSessionStore.update()` — it's a side-channel courtesy to the issuer, not a step in the issuance state machine, so a rejected or failed notification does not fail the session, and the session's `status`/`error` are exactly what they were before the call. This is also specifically what makes it safe to call concurrently with a `request_credential` call already in flight for the session's next credential configuration: `IssuanceSessionStore.get()` returns a live, shared `IssuanceSession` (not a copy), so a *mutating* concurrent call on the same session would not be safe, but a read-only one is.
+
+**Collapsed error handling for §11.3's two response shapes.** The spec defines two different non-2xx shapes for this endpoint: a missing/invalid Access Token gets an RFC 6750-style Authorization Error Response (typically 401, no required JSON body), while an invalid `notification_id` gets a MUST-400 with a JSON `{"error": "..."}` body (notably with no `error_description` field, unlike every other error-response model in this codebase). Rather than branching on status code to decide which shape to expect, `_try_parse_error` always *attempts* to parse `{"error": ...}` from the body and raises one `NotificationRejectedError(status_code, error)` either way, with `error` simply `None` when there was nothing parseable — the response is never forced into a shape it doesn't have, matching this project's existing posture on non-conformant/variant real-world response shapes (e.g. the pre-final singular-`credential` rejection discussed under `request_credential` above).
+
+**Known scope limit: `notification_id` is a single scalar.** `IssuanceSession.notification_id` follows the same guarded-overwrite pattern as `transaction_id`/`deferred_interval` (see `next_credential_index` above): a later Credential Request's response, if it carries its own `notification_id`, overwrites the session's current one. For a session requesting more than one credential configuration, this means only the most recently issued configuration's `notification_id` is ever reachable — once a second configuration's Credential Request completes, there is no way left to notify the issuer about the first one specifically. This is a deliberate MVP scope limit rather than a silently-dropped feature: a complete fix would key notifications by `credential_configuration_id` (e.g. `dict[str, str]` instead of a scalar), left as future work since it would also change `IssuanceSessionStore.update()`'s guarded-overwrite convention for this field.
+
+Implemented in [`src/mcp_oidc4vci/notification.py`](../src/mcp_oidc4vci/notification.py) (`notify_credential_issuer` is the session-aware entry point `server.py` calls; `send_credential_notification` is the lower-level client that just POSTs the fields to a known URL, named to match the MCP tool). Authenticated via [`src/mcp_oidc4vci/session_request.py`](../src/mcp_oidc4vci/session_request.py)'s `post_with_session_auth` — the same Bearer/DPoP-with-nonce-retry logic `request_credential`/`poll_deferred_credential` use, extracted out of `credential_request.py` into its own module specifically so this endpoint (which needs identical authentication over the same access token) doesn't duplicate it.
+
 ---
 
 ## Example Interaction

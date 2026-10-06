@@ -9,6 +9,7 @@ from mcp_oidc4vci.models import (
     CredentialOffer,
     CredentialOfferGrants,
     IssuanceFlowDescription,
+    NotificationErrorResponse,
     PreAuthorizedCodeGrant,
     PushedAuthorizationRequestErrorResponse,
     PushedAuthorizationRequestResponse,
@@ -164,6 +165,31 @@ def test_credential_issuer_metadata_parses_deferred_credential_endpoint() -> Non
     assert metadata.deferred_credential_endpoint == "https://issuer.example.com/deferred"
 
 
+def test_credential_issuer_metadata_notification_endpoint_defaults_to_absent() -> None:
+    metadata = CredentialIssuerMetadata.model_validate(
+        {
+            "credential_issuer": "https://issuer.example.com",
+            "credential_endpoint": "https://issuer.example.com/credential",
+            "credential_configurations_supported": {},
+        }
+    )
+
+    assert metadata.notification_endpoint is None
+
+
+def test_credential_issuer_metadata_parses_notification_endpoint() -> None:
+    metadata = CredentialIssuerMetadata.model_validate(
+        {
+            "credential_issuer": "https://issuer.example.com",
+            "credential_endpoint": "https://issuer.example.com/credential",
+            "notification_endpoint": "https://issuer.example.com/notification",
+            "credential_configurations_supported": {},
+        }
+    )
+
+    assert metadata.notification_endpoint == "https://issuer.example.com/notification"
+
+
 def test_authorization_server_metadata_requires_issuer_and_token_endpoint() -> None:
     with pytest.raises(ValidationError):
         AuthorizationServerMetadata.model_validate({"issuer": "https://as.example.com"})
@@ -241,6 +267,19 @@ def test_token_success_response_requires_access_token_and_token_type() -> None:
 def test_token_error_response_requires_error() -> None:
     with pytest.raises(ValidationError):
         TokenErrorResponse.model_validate({"error_description": "no code given"})
+
+
+def test_notification_error_response_requires_error() -> None:
+    with pytest.raises(ValidationError):
+        NotificationErrorResponse.model_validate({})
+
+
+def test_notification_error_response_has_no_error_description_field() -> None:
+    # Unlike every other error-response model in this file, the spec defines no
+    # error_description for a Notification Error Response (§11.3) -- an extra field would be
+    # silently ignored by pydantic's default config, so assert on the model's own fields
+    # instead of round-tripping one through model_validate.
+    assert "error_description" not in NotificationErrorResponse.model_fields
 
 
 def test_issuance_flow_description_dumps_its_ordered_steps() -> None:

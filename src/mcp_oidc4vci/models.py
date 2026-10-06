@@ -95,6 +95,10 @@ class CredentialIssuerMetadata(BaseModel):
     # spec "Deferred Credential Endpoint" (§9). Presence is what a session that received a
     # transaction_id needs to poll for the credential later.
     deferred_credential_endpoint: str | None = None
+    # spec "Notification Endpoint" (§11, field defined in §12.2.4). OPTIONAL for the issuer to
+    # support; absence means a notification_id returned by a Credential Response simply can't
+    # be acted on.
+    notification_endpoint: str | None = None
     credential_configurations_supported: dict[str, CredentialConfiguration]
 
 
@@ -186,3 +190,17 @@ class CredentialErrorResponse(BaseModel):
 
     error: str
     error_description: str | None = None
+
+
+# spec "Notification Request" (§11.1): the only three values `event` may take.
+NotificationEvent = Literal["credential_accepted", "credential_failure", "credential_deleted"]
+
+
+class NotificationErrorResponse(BaseModel):
+    """A Notification Error Response (spec "Notification Error Response", §11.3).
+
+    Unlike every other error-response model in this file, the spec defines no
+    `error_description` field here -- only `error`.
+    """
+
+    error: str

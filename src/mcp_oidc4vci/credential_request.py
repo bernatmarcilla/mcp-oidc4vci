@@ -14,7 +14,6 @@ the same "one at a time, call again for the next" rule once that one resolves.
 
 import json
 import logging
-from collections.abc import Awaitable, Callable
 
 import httpx
 from pydantic import ValidationError
@@ -31,18 +30,18 @@ from mcp_oidc4vci.models import (
     CredentialResponse,
 )
 from mcp_oidc4vci.nonce import InvalidNonceResponseError, NoncePoster, request_nonce
+from mcp_oidc4vci.session_request import (
+    AuthenticatedRequestError,
+    post_with_session_auth,
+)
+from mcp_oidc4vci.session_request import (
+    SessionPoster as CredentialRequester,
+)
 from mcp_oidc4vci.wallet import WalletAdapter
 
 logger = logging.getLogger(__name__)
 
-# (url, json_body, headers) -> (status_code, response_headers, body). Response header keys
-# are lowercased, matching HTTP's case-insensitive header names.
-CredentialRequester = Callable[
-    [str, dict[str, object], dict[str, str]], Awaitable[tuple[int, dict[str, str], str]]
-]
-
 _HTTP_TIMEOUT_SECONDS = 10.0
-_DPOP_NONCE_ERROR = 'error="use_dpop_nonce"'
 
 
 class CredentialRequestError(Exception):
@@ -224,11 +223,15 @@ async def _send_credential_request(
     }
 
     try:
-        status_code, response_body = await _post_with_dpop(
+        status_code, response_body = await post_with_session_auth(
             post_credential_request or _post_credential_request, credential_endpoint, body, session
         )
         response = _parse_credential_response(status_code, response_body)
-    except (CredentialRequestRejectedError, InvalidCredentialResponseError) as exc:
+    except (
+        CredentialRequestRejectedError,
+        InvalidCredentialResponseError,
+        AuthenticatedRequestError,
+    ) as exc:
         logger.warning("Session %s failed during credential request: %s", session.session_id, exc)
         return await sessions.update(session.session_id, status="failed", error=str(exc))
 
@@ -281,14 +284,18 @@ async def poll_deferred_credential(
     body: dict[str, object] = {"transaction_id": session.transaction_id}
 
     try:
-        status_code, response_body = await _post_with_dpop(
+        status_code, response_body = await post_with_session_auth(
             post_credential_request or _post_credential_request,
             issuer_metadata.deferred_credential_endpoint,
             body,
             session,
         )
         response = _parse_credential_response(status_code, response_body)
-    except (CredentialRequestRejectedError, InvalidCredentialResponseError) as exc:
+    except (
+        CredentialRequestRejectedError,
+        InvalidCredentialResponseError,
+        AuthenticatedRequestError,
+    ) as exc:
         logger.warning(
             "Session %s failed polling the deferred credential: %s", session.session_id, exc
         )
@@ -319,6 +326,7 @@ async def _finalize_credential_response(
             status="awaiting_deferred_credential",
             transaction_id=response.transaction_id,
             deferred_interval=response.interval,
+            notification_id=response.notification_id,
         )
 
     # _parse_credential_response guarantees credentials is set whenever transaction_id isn't.
@@ -344,6 +352,7 @@ async def _finalize_credential_response(
             session.session_id,
             status="ready_for_credential_request",
             next_credential_index=next_index,
+            notification_id=response.notification_id,
         )
 
     logger.info(
@@ -352,7 +361,10 @@ async def _finalize_credential_response(
         len(session.credential_configuration_ids),
     )
     return await sessions.update(
-        session.session_id, status="completed", next_credential_index=next_index
+        session.session_id,
+        status="completed",
+        next_credential_index=next_index,
+        notification_id=response.notification_id,
     )
 
 
@@ -389,58 +401,6 @@ def _parse_credential_response(status_code: int, body: str) -> CredentialRespons
             f"match the expected error structure: {exc}"
         ) from exc
     raise CredentialRequestRejectedError(error.error, error.error_description)
-
-
-async def _post_with_dpop(
-    poster: CredentialRequester,
-    url: str,
-    body: dict[str, object],
-    session: IssuanceSession,
-) -> tuple[int, str]:
-    """POST the Credential Request, attaching Authorization (Bearer or DPoP, per whether the
-    session's access token ended up DPoP-bound — RFC 9449 §7.1) and, for a DPoP-bound token,
-    a DPoP proof over this request. Retries once with a server-supplied nonce if the
-    credential endpoint demands one (§9).
-    """
-    assert session.access_token is not None
-    scheme = "DPoP" if session.dpop_bound else "Bearer"
-    dpop_nonce: str | None = None
-
-    for attempt in range(2):
-        headers = {"Authorization": f"{scheme} {session.access_token}"}
-        if session.dpop_bound:
-            assert session.dpop_key is not None
-            headers["DPoP"] = session.dpop_key.create_proof(
-                http_method="POST",
-                http_uri=url,
-                nonce=dpop_nonce,
-                access_token=session.access_token,
-            )
-
-        try:
-            status_code, response_headers, response_body = await poster(url, body, headers)
-        except Exception as exc:
-            raise InvalidCredentialResponseError(
-                f"Failed to reach credential endpoint {url!r}: {exc}"
-            ) from exc
-
-        needs_retry = (
-            status_code == 401
-            and session.dpop_bound
-            and attempt == 0
-            and _DPOP_NONCE_ERROR in (response_headers.get("www-authenticate") or "")
-        )
-        new_nonce = response_headers.get("dpop-nonce")
-        if needs_retry and new_nonce:
-            logger.info(
-                "Credential endpoint %r demanded a DPoP nonce; retrying with the supplied nonce.",
-                url,
-            )
-            dpop_nonce = new_nonce
-            continue
-        return status_code, response_body
-
-    raise InvalidCredentialResponseError("Credential endpoint kept demanding a new DPoP nonce.")
 
 
 async def _post_credential_request(

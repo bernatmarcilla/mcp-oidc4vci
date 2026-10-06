@@ -30,6 +30,9 @@ from mcp_oidc4vci.issuance import begin_authorization as begin_authorization_flo
 from mcp_oidc4vci.issuance import describe_issuance_flow as build_issuance_flow_description
 from mcp_oidc4vci.issuance import initiate_issuance as start_issuance
 from mcp_oidc4vci.issuance import submit_authorization_result as finish_authorization
+from mcp_oidc4vci.models import NotificationEvent
+from mcp_oidc4vci.notification import NotificationRequestError
+from mcp_oidc4vci.notification import notify_credential_issuer as send_notification
 from mcp_oidc4vci.wallet import MockWalletAdapter
 
 logger = logging.getLogger(__name__)
@@ -239,6 +242,35 @@ async def submit_wallet_proof(session_id: str, proof_jwt: str) -> dict[str, Any]
     return _issuance_session_output(session)
 
 
+@mcp.tool
+async def send_credential_notification(
+    session_id: str, event: NotificationEvent, event_description: str | None = None
+) -> dict[str, Any]:
+    """Tell the Credential Issuer whether a previously issued credential was accepted,
+    failed, or deleted (spec "Notification Endpoint").
+
+    Reports on the `notification_id` carried by the most recent Credential Response or
+    Deferred Credential Response for this session, if the issuer returned one. `event` must
+    be `credential_accepted`, `credential_failure`, or `credential_deleted`; `event_description`
+    is an optional human-readable note for the issuer's developers. Support for this endpoint
+    is OPTIONAL for the issuer, and sending a notification is optional and best-effort for the
+    Wallet -- both "the session has nothing to notify about yet" and "this issuer doesn't
+    support notifications" are reported as errors rather than silently ignored, but neither
+    changes the session's status: this is a side-channel courtesy to the issuer, not a step
+    in the issuance flow, so it never marks the session `failed`.
+    """
+    try:
+        await send_notification(session_id, event, event_description, sessions=_sessions)
+    except (
+        IssuanceSessionNotFoundError,
+        InvalidCredentialIssuerMetadataError,
+        NotificationRequestError,
+    ) as exc:
+        raise ToolError(str(exc)) from exc
+    session = await _sessions.get(session_id)
+    return _issuance_session_output(session)
+
+
 def debug_inspect_mock_wallet_credentials() -> list[dict[str, Any]]:
     """DEBUG ONLY: list credentials the in-process MockWalletAdapter has received.
 
@@ -286,6 +318,8 @@ def _issuance_session_output(session: IssuanceSession) -> dict[str, Any]:
         output["authorization_url"] = session.authorization_url
     if session.status == "awaiting_deferred_credential" and session.deferred_interval is not None:
         output["deferred_interval"] = session.deferred_interval
+    if session.notification_id is not None:
+        output["notification_id"] = session.notification_id
     return output
 
 

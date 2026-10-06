@@ -186,6 +186,14 @@ class IssuanceSession:
     `ready_for_credential_request` rather than `completed` — the caller is meant to call the
     same tool again for the next one, the same way `poll_deferred_credential` is meant to be
     called again to check a pending one.
+
+    `notification_id`, when a Credential Response or Deferred Credential Response carried one
+    (spec §8.3/§9.2), is what `send_credential_notification` reports back to the Credential
+    Issuer about. It's a single scalar, following the same guarded-overwrite pattern as
+    `transaction_id`/`deferred_interval` — for a multi-configuration session, this means only
+    the most recently issued configuration's `notification_id` is ever reachable; an earlier
+    configuration's notification opportunity is silently superseded once a later one resolves.
+    This is a deliberate MVP scope limit, not a bug — see docs/ARCHITECTURE.md.
     """
 
     session_id: str
@@ -212,6 +220,7 @@ class IssuanceSession:
     transaction_id: str | None = None
     deferred_interval: int | None = None
     next_credential_index: int = 0
+    notification_id: str | None = None
 
 
 class IssuanceSessionStore:
@@ -293,6 +302,7 @@ class IssuanceSessionStore:
         transaction_id: str | None = None,
         deferred_interval: int | None = None,
         next_credential_index: int | None = None,
+        notification_id: str | None = None,
     ) -> IssuanceSession:
         async with self._lock:
             self._evict_expired_locked()
@@ -336,6 +346,8 @@ class IssuanceSessionStore:
                 session.deferred_interval = deferred_interval
             if next_credential_index is not None:
                 session.next_credential_index = next_credential_index
+            if notification_id is not None:
+                session.notification_id = notification_id
             return session
 
     async def get(self, session_id: str) -> IssuanceSession:

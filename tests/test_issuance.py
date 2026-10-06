@@ -191,6 +191,37 @@ async def test_session_store_update_sets_and_clears_proof_nonce() -> None:
     assert completed.proof_nonce is None
 
 
+async def test_session_store_update_sets_notification_id() -> None:
+    store = IssuanceSessionStore()
+    session = await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+
+    updated = await store.update(
+        session.session_id, status="completed", notification_id="3fwe98js"
+    )
+
+    assert updated.notification_id == "3fwe98js"
+
+
+async def test_session_store_update_preserves_notification_id_when_not_given() -> None:
+    # notification_id follows the same guarded-overwrite pattern as transaction_id: an update
+    # call that doesn't pass it must not clear a previously stored value.
+    store = IssuanceSessionStore()
+    session = await store.create(
+        credential_issuer=ISSUER,
+        credential_configuration_ids=["x"],
+        flow_type=AUTHORIZATION_CODE_FLOW,
+    )
+    await store.update(session.session_id, status="completed", notification_id="3fwe98js")
+
+    updated = await store.update(session.session_id, status="completed")
+
+    assert updated.notification_id == "3fwe98js"
+
+
 async def test_session_store_get_raises_for_an_unknown_session() -> None:
     with pytest.raises(IssuanceSessionNotFoundError):
         await IssuanceSessionStore().get("does-not-exist")
