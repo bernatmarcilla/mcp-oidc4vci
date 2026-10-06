@@ -26,6 +26,8 @@ The central question this project explores is:
 
 For the full system design, see [Architecture](docs/ARCHITECTURE.md).
 
+**Building or operating a wallet and want to offer issuance without implementing OIDC4VCI yourself?** See the [Wallet Integration Guide](docs/WALLET_INTEGRATION.md) — nothing about using this server that way requires an AI agent in the loop; any MCP client, including a plain deterministic orchestrator, can drive these tools.
+
 ---
 
 ## Architecture at a glance
@@ -141,4 +143,5 @@ This server has no HTTP endpoint of its own to receive a browser redirect (see [
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — components, design principles, wallet boundary, data flow, MCP tool contracts, security requirements.
+- [Wallet Integration Guide](docs/WALLET_INTEGRATION.md) — for a team integrating their own wallet against this server instead of implementing OIDC4VCI issuance themselves: the two supported integration shapes, the full tool catalog, the session state machine, and current limitations to check against your target issuer(s).
 - [Roadmap](docs/ROADMAP.md) — delivery phases, MVP scope, and what's explicitly out of scope.
